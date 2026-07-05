@@ -224,8 +224,10 @@ def reconstruct_prolongation_matrices(batch, edge_predictions):
         if zero_mask.any():
             # For nodes with no prolongation entries, use baseline
             # This shouldn't happen often, but prevents singular matrices
+            # FIX: Use detach() to avoid breaking gradients (baseline is not trainable anyway)
             baseline_P_dense = torch.from_numpy(baseline_P.toarray()).float().to(device)
-            P_pred[zero_mask] = baseline_P_dense[zero_mask]
+            P_pred[zero_mask] = baseline_P_dense[zero_mask].detach()
+            # Note: This won't have gradients, but that's OK since these are fallback values
 
         # Convert A and S to numpy (these are fixed, no gradients needed)
         A_dense = A.toarray()

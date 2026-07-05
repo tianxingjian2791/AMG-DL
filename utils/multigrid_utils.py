@@ -261,8 +261,9 @@ class TwoGridLoss(torch.nn.Module):
         Returns:
             Average loss over batch (torch.Tensor, differentiable)
         """
-        batch_loss = 0.0
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # FIX: Use list to collect losses, then stack and mean
+        # This preserves the computation graph properly
+        losses = []
 
         for A, P, S in zip(A_list, P_list, S_list):
             # Compute two-grid error matrix (all PyTorch operations)
@@ -278,10 +279,14 @@ class TwoGridLoss(torch.nn.Module):
                 eigenvalues = torch.linalg.eigvals(M)
                 loss = torch.max(torch.abs(eigenvalues)).real
 
-            batch_loss = batch_loss + loss
+            losses.append(loss)
 
-        # Return average loss as tensor (maintains computation graph!)
-        avg_loss = batch_loss / len(A_list)
+        # Stack losses and compute mean (preserves gradients!)
+        if len(losses) == 0:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        avg_loss = torch.stack(losses).mean()
 
         return avg_loss
 
