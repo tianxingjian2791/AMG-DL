@@ -1,6 +1,6 @@
 # Accelerating Algebraic Multigrid (AMG) with Deep Learning
 
-**PACS Course Project** - Learning optimal AMG parameters using Graph Neural Networks
+**Project** - Learning optimal AMG parameters using Graph Neural Networks
 
 This project implements a two-stage deep learning framework for accelerating Algebraic Multigrid (AMG) solvers by predicting optimal coarsening parameters and interpolation operators (or prolongation matrices).
 
