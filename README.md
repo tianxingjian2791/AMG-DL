@@ -4,7 +4,7 @@
 
 This project implements a two-stage deep learning framework for accelerating Algebraic Multigrid (AMG) solvers by predicting optimal coarsening parameters and interpolation operators (or prolongation matrices).
 
-**Old Project**: For the previous project, refer to the tag v1.0 (https://github.com/tianxingjian2791/PACSProject/tree/v1.0).
+**Old Project**: For the previous project, refer to the tag v1.0 (https://github.com/tianxingjian2791/AMG-DL/tree/v1.0).
 
 ---
 
