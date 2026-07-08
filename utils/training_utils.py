@@ -294,7 +294,8 @@ def get_device(prefer_cuda=True):
     Get computing device
 
     Parameters:
-        prefer_cuda: whether to prefer CUDA if available
+        prefer_cuda: whether to prefer CUDA if available. On Apple Silicon,
+            this will fall back to the MPS backend when CUDA is unavailable.
 
     Returns:
         torch.device
@@ -302,6 +303,9 @@ def get_device(prefer_cuda=True):
     if prefer_cuda and torch.cuda.is_available():
         device = torch.device('cuda')
         print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+    elif prefer_cuda and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print('Using Apple Silicon GPU device: MPS')
     else:
         device = torch.device('cpu')
         print("Using CPU device")

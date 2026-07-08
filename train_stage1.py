@@ -40,12 +40,23 @@ def parse_args():
     # Data configuration
     parser.add_argument('--dataset', type=str, required=True,
                       help='Dataset directory (e.g., datasets/unified)')
+    parser.add_argument('--problem-type', type=str, default='auto',
+                      choices=['auto', 'D', 'E', 'S', 'GL', 'SC'],
+                      help='Problem type for dataset resolution')
+    parser.add_argument('--diffusion-scale', type=str, default='small',
+                      choices=['small', 'large', 'paper'],
+                      help='Diffusion scale folder to use when problem-type is D')
     parser.add_argument('--train-file', type=str, default='train_D.csv',
                       help='Training CSV filename (or problem type for NPY)')
     parser.add_argument('--test-file', type=str, default='test_D.csv',
                       help='Test CSV filename (or problem type for NPY)')
     parser.add_argument('--use-npy', action='store_true',
                       help='Use NPY/NPZ format instead of CSV (5× faster)')
+    parser.add_argument('--split-policy', type=str, default='test_case',
+                      choices=['test_case', 'sample', 'h', 'epsilon'],
+                      help='Split policy for unsplit NPZ datasets')
+    parser.add_argument('--train-ratio', type=float, default=0.8,
+                      help='Training ratio for unsplit NPZ datasets')
 
     # Training configuration
     parser.add_argument('--epochs', type=int, default=50,
@@ -80,6 +91,26 @@ def parse_args():
                       help='Experiment name (default: {model}_{timestamp})')
 
     return parser.parse_args()
+
+
+def resolve_dataset_root(base_dataset, problem_type, diffusion_scale):
+    """Resolve the on-disk dataset root, including scale-specific diffusion folders."""
+    if problem_type != 'D':
+        return base_dataset
+
+    diffusion_root = os.path.join(base_dataset, 'diffusion', diffusion_scale)
+    return diffusion_root if os.path.exists(diffusion_root) else base_dataset
+
+
+def infer_problem_type(train_file, test_file, requested_problem_type):
+    """Infer diffusion datasets from filenames when the problem type is left on auto."""
+    if requested_problem_type != 'auto':
+        return requested_problem_type
+
+    file_blob = f"{train_file}_{test_file}".lower()
+    if '_d' in file_blob:
+        return 'D'
+    return 'auto'
 
 
 def create_model(args, device):
@@ -126,7 +157,10 @@ def create_dataloaders(args):
                 train_problem=train_problem,
                 test_problem=test_problem,
                 batch_size=args.batch_size,
-                num_workers=args.num_workers
+                num_workers=args.num_workers,
+                split_policy=args.split_policy,
+                split_seed=args.seed,
+                train_ratio=args.train_ratio
             )
         else:
             # CNN with CSV format (legacy)
@@ -168,7 +202,10 @@ def create_dataloaders(args):
                 train_problem=train_problem,
                 test_problem=test_problem,
                 batch_size=args.batch_size,
-                num_workers=args.num_workers
+                num_workers=args.num_workers,
+                split_policy=args.split_policy,
+                split_seed=args.seed,
+                train_ratio=args.train_ratio
             )
         else:
             from data import create_theta_data_loaders
@@ -219,11 +256,23 @@ def main():
     print("Stage 1 Training: Theta Prediction")
     print(f"Model: {args.model}")
     print(f"Dataset: {args.dataset}")
+    print(f"Problem type: {args.problem_type}")
+    if args.problem_type == 'D':
+        print(f"Diffusion scale: {args.diffusion_scale}")
     print(f"Experiment: {args.experiment_name}")
     print("\n\n")
 
     # Get device
     device = get_device()
+
+    resolved_problem_type = infer_problem_type(args.train_file, args.test_file, args.problem_type)
+    dataset_root = resolve_dataset_root(args.dataset, resolved_problem_type, args.diffusion_scale)
+    if dataset_root != args.dataset:
+        print(f"Resolved dataset root: {dataset_root}")
+        args.dataset = dataset_root
+    if resolved_problem_type != args.problem_type:
+        print(f"Resolved problem type: {resolved_problem_type}")
+        args.problem_type = resolved_problem_type
 
     # Create dataloaders
     train_loader, test_loader = create_dataloaders(args)

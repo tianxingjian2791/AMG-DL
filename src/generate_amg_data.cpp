@@ -23,7 +23,9 @@
 
 #include "../include/DiffusionModel.hpp"
 #include "../include/ElasticModel.hpp"
+#ifdef DEAL_II_WITH_P4EST
 #include "../include/StokesModel.hpp"
+#endif
 #include "../include/GraphLaplacianModelEigen.hpp"
 #include "../include/AMGOperators.hpp"
 #include "../include/UnifiedDataGenerator.hpp"
@@ -34,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <array>
 #include <chrono>
 #include <iomanip>
 #include <cmath>
@@ -51,7 +54,8 @@ enum class ProblemType {
 
 enum class DatasetSplit {
     TRAIN,
-    TEST
+    TEST,
+    ALL
 };
 
 enum class OutputFormat {
@@ -62,18 +66,17 @@ enum class OutputFormat {
 };
 
 enum class DatasetScale {
-    SMALL,
-    MEDIUM,
-    LARGE,
-    XLARGE
+    SMALL = 0,
+    LARGE = 1,
+    PAPER = 2,
 };
 
 struct CommandLineArgs {
     ProblemType problem;
-    DatasetSplit split;
+    DatasetSplit split = DatasetSplit::ALL;
     OutputFormat format;
     DatasetScale scale;
-    std::string output_dir = "./datasets/unified";
+    std::string output_dir = "./datasets";
     int num_threads = 0;  // 0 = auto (OpenMP default)
     int seed = 42;
     bool verbose = false;
@@ -95,6 +98,23 @@ struct FEMScaleConfig {
         }
         return count;
     }
+};
+
+struct DiffusionExperimentRecord {
+    std::string scale_name;
+    int scale_id;
+    std::string pattern_name;
+    int pattern_id;
+    double epsilon;
+    unsigned int refinement;
+    double h;
+    double theta;
+    double rho;
+    unsigned int iterations;
+    double elapsed_sec;
+    int n_levels;
+    int n;
+    int nnz;
 };
 
 struct GraphScaleConfig {
@@ -137,9 +157,17 @@ std::string problem_type_to_string(ProblemType type) {
 std::string scale_to_string(DatasetScale scale) {
     switch (scale) {
         case DatasetScale::SMALL: return "small";
-        case DatasetScale::MEDIUM: return "medium";
         case DatasetScale::LARGE: return "large";
-        case DatasetScale::XLARGE: return "xlarge";
+        case DatasetScale::PAPER: return "paper";
+        default: return "unknown";
+    }
+}
+
+std::string split_to_string(DatasetSplit split) {
+    switch (split) {
+        case DatasetSplit::TRAIN: return "train";
+        case DatasetSplit::TEST: return "test";
+        case DatasetSplit::ALL: return "all";
         default: return "unknown";
     }
 }
@@ -149,34 +177,32 @@ class ConfigFactory {
 public:
     static FEMScaleConfig get_diffusion_config(DatasetScale scale, DatasetSplit split) {
         FEMScaleConfig config;
+        
+        const std::vector<double> three_theta_values = {0.24, 0.48, 0.72};
+        const std::vector<double> ten_theta_values = linspace(0.02, 0.9, 10);
+        const std::vector<double> paper_theta_values = linspace(0.02, 0.9, 25);
+        const std::vector<double> paper_epsilon_values = {0.0, 0.4, 0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.5, 5.0, 7.0, 9.5};
 
         switch (scale) {
             case DatasetScale::SMALL:
-                config.param1_values = linspace(0.5, 9.0, 5);      // epsilon: 5 values
-                config.theta_values = linspace(0.1, 0.8, 5);       // theta: 5 values
-                config.refinements = {3, 4};                        // 2 levels
-                // Total: 5 × 5 × 2 = 50 samples
-                break;
-
-            case DatasetScale::MEDIUM:
-                config.param1_values = linspace(0.0, 9.5, 10);     // epsilon: 10 values
-                config.theta_values = linspace(0.02, 0.9, 15);     // theta: 15 values
-                config.refinements = {3, 4, 5};                     // 3 levels
-                // Total: 10 × 15 × 3 = 450 samples
+                config.param1_values = {0.0, 0.8, 1.6, 2.4, 5.0, 9.5}; // epsilon subset from paper grid
+                config.theta_values = three_theta_values;
+                config.refinements = {4, 5, 6};                     // h = 1.25e-01 ... 3.12e-02
+                // Base total per pattern: 6 × 3 × 3 = 54 samples
                 break;
 
             case DatasetScale::LARGE:
-                config.param1_values = linspace(0.0, 9.5, 18);     // epsilon: 18 values
-                config.theta_values = linspace(0.02, 0.9, 50);     // theta: 50 values
-                config.refinements = {3, 4};                  // 2 levels
-                // Total: 18 × 50 × 2 = 1,800 samples (1200 for training, 600 for testing)
+                config.param1_values = paper_epsilon_values;
+                config.theta_values = ten_theta_values;             // 10 theta values for denser scatter data
+                config.refinements = {4, 5, 6, 7, 8, 9, 10, 11};    // h = 1.25e-01 ... 9.77e-04
+                // Base total per pattern: 12 × 10 × 8 = 960 samples
                 break;
 
-            case DatasetScale::XLARGE:
-                config.param1_values = linspace(0.0, 9.5, 20);     // epsilon: 20 values
-                config.theta_values = linspace(0.02, 0.9, 32);     // theta: 32 values
-                config.refinements = {3, 4, 5, 6};                  // 4 levels
-                // Total: 20 × 32 × 4 = 2,560 samples
+            case DatasetScale::PAPER:
+                config.param1_values = paper_epsilon_values;        // full paper epsilon grid
+                config.theta_values = paper_theta_values;           // full paper theta grid
+                config.refinements = {4, 5, 6, 7, 8, 9, 10, 11};    // h = 1.25e-01 ... 9.77e-04
+                // Base total per pattern: 12 × 25 × 8 = 2,400 samples
                 break;
         }
 
@@ -195,14 +221,6 @@ public:
                 // Total: 3 × 2 × 5 × 2 = 60 samples
                 break;
 
-            case DatasetScale::MEDIUM:
-                config.param1_values = {2.5, 2.5e2, 2.5e4, 2.5e6}; // E: 4 values
-                config.param2_values = {0.25, 0.3, 0.35};           // nu: 3 values
-                config.theta_values = linspace(0.02, 0.9, 15);      // theta: 15 values
-                config.refinements = {3, 4, 5};                      // 3 levels
-                // Total: 4 × 3 × 15 × 3 = 540 samples
-                break;
-
             case DatasetScale::LARGE:
                 config.param1_values = {2.5, 2.5e2, 2.5e4}; // 3 values
                 config.param2_values = {0.20, 0.25, 0.30, 0.35, 0.40};    // 5 values
@@ -211,7 +229,7 @@ public:
                 // Total: 3 × 5 × 50 × 2 = 1,500 samples (1000 for training, 500 for testing)
                 break;
 
-            case DatasetScale::XLARGE:
+            case DatasetScale::PAPER:
                 config.param1_values = {2.5, 2.5e2, 2.5e4, 2.5e6, 2.5e8}; // 5 values
                 config.param2_values = linspace(0.15, 0.45, 7);     // nu: 7 values
                 config.theta_values = linspace(0.02, 0.9, 32);      // theta: 32 values
@@ -235,14 +253,6 @@ public:
                 // Total: 6 × 1 × 5 × 2 = 60 samples
                 break;
 
-            case DatasetScale::MEDIUM:
-                config.param1_values = linspace(0.1, 6.1, 12);      // viscosity: 12 values
-                config.param2_values = {2, 3};                       // velocity_degree: 2 values
-                config.theta_values = linspace(0.02, 0.9, 15);       // theta: 15 values
-                config.refinements = {3, 4, 5};                       // 3 levels
-                // Total: 12 × 2 × 15 × 3 = 1,080 samples
-                break;
-
             case DatasetScale::LARGE:
                 config.param1_values = linspace(0.1, 6.1, 18);      // viscosity: 18 values
                 config.param2_values = {2};                       // velocity_degree: 1 values
@@ -251,7 +261,7 @@ public:
                 // Total: 18 × 1 × 50 × 2 = 1,800 samples (1200 for training, 600 for testing)
                 break;
 
-            case DatasetScale::XLARGE:
+            case DatasetScale::PAPER:
                 config.param1_values = linspace(0.1, 6.1, 20);      // viscosity: 20 values
                 config.param2_values = {2, 3, 4};                    // velocity_degree: 3 values
                 config.theta_values = linspace(0.02, 0.9, 32);       // theta: 32 values
@@ -272,17 +282,12 @@ public:
                 config.num_points = 64;
                 break;
 
-            case DatasetScale::MEDIUM:
-                config.num_samples = 500;
-                config.num_points = 128;
-                break;
-
             case DatasetScale::LARGE:
                 config.num_samples = 5000;
                 config.num_points = 64;  // Can be set to 256 for having rich computing resources
                 break;
 
-            case DatasetScale::XLARGE:
+            case DatasetScale::PAPER:
                 config.num_samples = 10000;
                 config.num_points = 512;
                 break;
@@ -300,14 +305,8 @@ public:
 class UnifiedAMGDataGenerator {
 public:
     explicit UnifiedAMGDataGenerator(const CommandLineArgs& args)
-        : args_(args)
-    {
-        // Compute output base directory
-        std::string split_str = (args_.split == DatasetSplit::TRAIN) ? "train" : "test";
-        output_base_ = args_.output_dir + "/" + split_str + "/raw/";
-
-        // Create directories
-        create_directories(output_base_);
+        : args_(args) {
+        output_base_ = args_.output_dir + "/" + split_to_string(args_.split) + "/raw/";
     }
 
     void generate() {
@@ -319,7 +318,14 @@ public:
                 generate_elastic();
                 break;
             case ProblemType::STOKES:
+#ifdef DEAL_II_WITH_P4EST
                 generate_stokes();
+#else
+                throw std::runtime_error(
+                    "Stokes generation requires a deal.II build with p4est support "
+                    "(DEAL_II_WITH_P4EST). Use a p4est-enabled deal.II install or choose another problem type."
+                );
+#endif
                 break;
             case ProblemType::GRAPH_LAPLACIAN:
                 generate_graph_laplacian();
@@ -369,17 +375,33 @@ private:
     void write_sample_npz_theta_gnn(const AMGOperators::CSRMatrix& A,
                                     double h, double theta, double rho,
                                     const std::string& output_dir,
-                                    int sample_id);
+                                    int sample_id,
+                                    int pattern_id = -1,
+                                    double epsilon = 0.0,
+                                    unsigned int refinement = 0,
+                                    unsigned int iterations = 0);
 
     void write_sample_npz_p_value(const AMGOperators::CSRMatrix& A,
                                  double h, double theta, double rho,
                                  const std::string& output_dir,
-                                 int sample_id);
+                                 int sample_id,
+                                 int pattern_id = -1,
+                                 double epsilon = 0.0,
+                                 unsigned int refinement = 0,
+                                 unsigned int iterations = 0);
 
     void write_sample_npz_theta_cnn(const AMGOperators::CSRMatrix& A,
                                    double h, double theta, double rho,
                                    const std::string& output_dir,
-                                   int sample_id);
+                                   int sample_id,
+                                   int pattern_id = -1,
+                                   double epsilon = 0.0,
+                                   unsigned int refinement = 0,
+                                   unsigned int iterations = 0);
+
+    void append_diffusion_report(const std::string& report_path,
+                                 const DiffusionExperimentRecord& record,
+                                 bool write_header);
 
     void print_progress(int current, int total,
                        std::chrono::steady_clock::time_point start);
@@ -397,7 +419,7 @@ void UnifiedAMGDataGenerator::open_output_files(
     std::ofstream& p_value_file)
 {
     std::string problem_suffix = problem_type_to_string(args_.problem);
-    std::string split_prefix = (args_.split == DatasetSplit::TRAIN) ? "train" : "test";
+    std::string split_prefix = split_to_string(args_.split);
 
     if (args_.format == OutputFormat::THETA_CNN || args_.format == OutputFormat::ALL) {
         std::string path = output_base_ + "theta_cnn/";
@@ -438,6 +460,36 @@ void UnifiedAMGDataGenerator::close_output_files(
     if (theta_cnn_file.is_open()) theta_cnn_file.close();
     if (theta_gnn_file.is_open()) theta_gnn_file.close();
     if (p_value_file.is_open()) p_value_file.close();
+}
+
+void UnifiedAMGDataGenerator::append_diffusion_report(
+    const std::string& report_path,
+    const DiffusionExperimentRecord& record,
+    bool write_header)
+{
+    std::ofstream report(report_path, std::ios::out | std::ios::app);
+    if (!report) {
+        throw std::runtime_error("Failed to open diffusion report file: " + report_path);
+    }
+
+    if (write_header) {
+        report << "scale,scale_id,pattern,pattern_id,epsilon,refinement,h,theta,rho,iterations,elapsed_sec,n_levels,n,nnz\n";
+    }
+
+    report << record.scale_name << ","
+           << record.scale_id << ","
+           << record.pattern_name << ","
+           << record.pattern_id << ","
+           << record.epsilon << ","
+           << record.refinement << ","
+           << record.h << ","
+           << record.theta << ","
+           << record.rho << ","
+           << record.iterations << ","
+           << record.elapsed_sec << ","
+           << record.n_levels << ","
+           << record.n << ","
+           << record.nnz << "\n";
 }
 
 void UnifiedAMGDataGenerator::write_sample_theta_cnn(
@@ -562,7 +614,11 @@ void UnifiedAMGDataGenerator::write_sample_npz_theta_gnn(
     const AMGOperators::CSRMatrix& A,
     double h, double theta, double rho,
     const std::string& output_dir,
-    int sample_id)
+    int sample_id,
+    int pattern_id,
+    double epsilon,
+    unsigned int refinement,
+    unsigned int iterations)
 {
     // Create filename: sample_00000.npz
     std::ostringstream filename;
@@ -595,12 +651,15 @@ void UnifiedAMGDataGenerator::write_sample_npz_theta_gnn(
         edge_index_flat.push_back(static_cast<double>(edge_dst[i]));
     }
 
-    // Create metadata array: [n, rho, h, epsilon=0.0]
+    // Create metadata array: [n, rho, h, epsilon, pattern_id, refinement, iterations]
     std::vector<double> metadata = {
         static_cast<double>(A.n_rows),
         rho,
         h,
-        0.0  // epsilon (not used for graph problems)
+        epsilon,
+        static_cast<double>(pattern_id),
+        static_cast<double>(refinement),
+        static_cast<double>(iterations)
     };
 
     std::vector<double> theta_arr = {theta};
@@ -628,7 +687,11 @@ void UnifiedAMGDataGenerator::write_sample_npz_p_value(
     const AMGOperators::CSRMatrix& A,
     double h, double theta, double rho,
     const std::string& output_dir,
-    int sample_id)
+    int sample_id,
+    int pattern_id,
+    double epsilon,
+    unsigned int refinement,
+    unsigned int iterations)
 {
     // Compute AMG operators
     std::vector<int> cf_splitting = AMGOperators::classical_cf_splitting(A, theta);
@@ -643,12 +706,16 @@ void UnifiedAMGDataGenerator::write_sample_npz_p_value(
         }
     }
 
-    // Create metadata: [n, theta, rho, h]
+    // Create metadata: [n, theta, rho, h, pattern_id, epsilon, refinement, iterations]
     std::vector<double> metadata = {
         static_cast<double>(A.n_rows),
         theta,
         rho,
-        h
+        h,
+        static_cast<double>(pattern_id),
+        epsilon,
+        static_cast<double>(refinement),
+        static_cast<double>(iterations)
     };
 
     // Create filename
@@ -684,7 +751,11 @@ void UnifiedAMGDataGenerator::write_sample_npz_theta_cnn(
     const AMGOperators::CSRMatrix& A,
     double h, double theta, double rho,
     const std::string& output_dir,
-    int sample_id)
+    int sample_id,
+    int pattern_id,
+    double epsilon,
+    unsigned int refinement,
+    unsigned int iterations)
 {
     // Pool matrix to 50x50
     std::vector<std::vector<double>> V;
@@ -706,12 +777,16 @@ void UnifiedAMGDataGenerator::write_sample_npz_theta_cnn(
         }
     }
 
-    // Metadata: [n, rho, h, theta]
+    // Metadata: [n, rho, h, theta, pattern_id, epsilon, refinement, iterations]
     std::vector<double> metadata = {
         static_cast<double>(A.n_rows),
         rho,
         h,
-        theta
+        theta,
+        static_cast<double>(pattern_id),
+        epsilon,
+        static_cast<double>(refinement),
+        static_cast<double>(iterations)
     };
 
     std::vector<double> y_arr = {rho};  // y = rho (convergence factor to predict)
@@ -778,8 +853,17 @@ void UnifiedAMGDataGenerator::print_final_summary(
 
 void UnifiedAMGDataGenerator::generate_diffusion() {
     FEMScaleConfig config = ConfigFactory::get_diffusion_config(args_.scale, args_.split);
+    const std::array<AMGDiffusion::DiffusionPattern, 4> patterns = {
+        AMGDiffusion::DiffusionPattern::VERTICAL_STRIPES,
+        AMGDiffusion::DiffusionPattern::CHECKERBOARD_2X2,
+        AMGDiffusion::DiffusionPattern::VERTICAL_STRIPES_4,
+        AMGDiffusion::DiffusionPattern::CHECKERBOARD_4X4
+    };
+    const std::string diffusion_scale = scale_to_string(args_.scale);
+    const std::string diffusion_base = args_.output_dir + "/diffusion/" + diffusion_scale + "/raw/";
+    const std::vector<double> param1_values_vec = config.param1_values;
 
-    int total = config.total_samples();
+    int total = static_cast<int>(param1_values_vec.size() * config.refinements.size() * config.theta_values.size() * patterns.size());
     int current = 0;
     auto start_time = std::chrono::steady_clock::now();
 
@@ -790,76 +874,133 @@ void UnifiedAMGDataGenerator::generate_diffusion() {
     std::cout << "Format: " << (args_.use_npy ? "NPZ (binary)" : "CSV (text)") << std::endl;
     std::cout << "\n" << std::endl;
 
-    // Setup output (CSV or NPZ)
     std::ofstream theta_cnn_file, theta_gnn_file, p_value_file;
     std::string npy_theta_cnn_dir, npy_theta_gnn_dir, npy_p_value_dir;
 
     if (args_.use_npy) {
         std::string problem_suffix = problem_type_to_string(args_.problem);
-        std::string split_prefix = (args_.split == DatasetSplit::TRAIN) ? "train" : "test";
 
         if (args_.format == OutputFormat::THETA_CNN || args_.format == OutputFormat::ALL) {
-            npy_theta_cnn_dir = output_base_ + "theta_cnn_npy/" + split_prefix + "_" + problem_suffix;
+            npy_theta_cnn_dir = diffusion_base + "theta_cnn_npy/" + problem_suffix;
             create_directories(npy_theta_cnn_dir);
         }
         if (args_.format == OutputFormat::THETA_GNN || args_.format == OutputFormat::ALL) {
-            npy_theta_gnn_dir = output_base_ + "theta_gnn_npy/" + split_prefix + "_" + problem_suffix;
+            npy_theta_gnn_dir = diffusion_base + "theta_gnn_npy/" + problem_suffix;
             create_directories(npy_theta_gnn_dir);
         }
         if (args_.format == OutputFormat::P_VALUE || args_.format == OutputFormat::ALL) {
-            npy_p_value_dir = output_base_ + "p_value_npy/" + split_prefix + "_" + problem_suffix;
+            npy_p_value_dir = diffusion_base + "p_value_npy/" + problem_suffix;
             create_directories(npy_p_value_dir);
         }
     } else {
-        open_output_files(theta_cnn_file, theta_gnn_file, p_value_file);
+        std::string problem_suffix = problem_type_to_string(args_.problem);
+
+        if (args_.format == OutputFormat::THETA_CNN || args_.format == OutputFormat::ALL) {
+            std::string path = diffusion_base + "theta_cnn/";
+            create_directories(path);
+            path += problem_suffix + ".csv";
+            theta_cnn_file.open(path);
+            if (!theta_cnn_file) {
+                throw std::runtime_error("Failed to open diffusion theta_cnn output file: " + path);
+            }
+        }
+
+        if (args_.format == OutputFormat::THETA_GNN || args_.format == OutputFormat::ALL) {
+            std::string path = diffusion_base + "theta_gnn/";
+            create_directories(path);
+            path += problem_suffix + ".csv";
+            theta_gnn_file.open(path);
+            if (!theta_gnn_file) {
+                throw std::runtime_error("Failed to open diffusion theta_gnn output file: " + path);
+            }
+        }
+
+        if (args_.format == OutputFormat::P_VALUE || args_.format == OutputFormat::ALL) {
+            std::string path = diffusion_base + "p_value/";
+            create_directories(path);
+            path += problem_suffix + ".csv";
+            p_value_file.open(path);
+            if (!p_value_file) {
+                throw std::runtime_error("Failed to open diffusion p_value output file: " + path);
+            }
+        }
     }
 
-    std::vector<double> param1_values_vec;
-    // For diffusion, we can create a train/test split by using only a subset of epsilon values for training
-    if (args_.split == DatasetSplit::TRAIN) {
-        size_t train_size = static_cast<size_t>(config.param1_values.size() * (2/3.0));  // Use first 2/3 of epsilon values for training
-        param1_values_vec = std::vector<double>(config.param1_values.begin(), config.param1_values.begin() + train_size);
-    } else {
-        size_t test_size = static_cast<size_t>(config.param1_values.size() * (1/3.0));  // Use last 1/3 of epsilon values for testing
-        param1_values_vec = std::vector<double>(config.param1_values.end() - test_size, config.param1_values.end());
+    std::string diffusion_report_dir = diffusion_base + "diffusion_reports/";
+    create_directories(diffusion_report_dir);
+    std::string diffusion_report_path = diffusion_report_dir +
+        "D.csv";
+    {
+        std::ofstream report(diffusion_report_path, std::ios::out | std::ios::trunc);
+        if (!report) {
+            throw std::runtime_error("Failed to initialize diffusion report file: " + diffusion_report_path);
+        }
+        report << "scale,scale_id,pattern,pattern_id,epsilon,refinement,h,theta,rho,iterations,elapsed_sec,n_levels,n,nnz\n";
     }
 
-    // Nested loops over all parameters
-    for (double epsilon : param1_values_vec) {
-        for (unsigned int refinement : config.refinements) {
-            for (double theta : config.theta_values) {
-                // Create solver (new simplified constructor without pattern)
-                AMGDiffusion::Solver<2> solver(epsilon, refinement);
-                solver.set_theta(theta);
+    // Nested loops over all parameters and the four coefficient patterns
+    for (auto pattern : patterns) {
+        for (double epsilon : param1_values_vec) {
+            for (unsigned int refinement : config.refinements) {
+                for (double theta : config.theta_values) {
+                    AMGDiffusion::Solver<2> solver(pattern, epsilon, refinement);
+                    solver.set_theta(theta);
 
-                // Solve (this stores convergence metrics internally)
-                std::ofstream dummy_file;
-                solver.run(dummy_file);
+                    // Solve (this stores convergence metrics internally)
+                    std::ofstream dummy_file;
+                    solver.run(dummy_file);
 
-                // Extract results using getter methods
-                AMGOperators::CSRMatrix A = solver.get_system_matrix_csr();
-                double h = solver.get_mesh_size();
-                double rho = solver.get_convergence_factor();
+                    // Extract results using getter methods
+                    AMGOperators::CSRMatrix A = solver.get_system_matrix_csr();
+                    double h = solver.get_mesh_size();
+                    double rho = solver.get_convergence_factor();
+                    double elapsed_sec = solver.get_linear_solve_elapsed_sec();
+                    unsigned int iterations = solver.get_solver_iterations();
+                    unsigned int n_levels = solver.get_amg_hierarchy_levels();
+                    int pattern_id = static_cast<int>(pattern);
+                    std::string pattern_name = AMGDiffusion::pattern_to_string(pattern);
 
-                // Write sample
-                if (args_.use_npy) {
-                    if (!npy_theta_cnn_dir.empty()) {
-                        write_sample_npz_theta_cnn(A, h, theta, rho, npy_theta_cnn_dir, current);
+                    DiffusionExperimentRecord record{
+                        diffusion_scale,
+                        static_cast<int>(args_.scale),
+                        pattern_name,
+                        pattern_id,
+                        epsilon,
+                        refinement,
+                        h,
+                        theta,
+                        rho,
+                        iterations,
+                        elapsed_sec,
+                        static_cast<int>(n_levels),
+                        A.n_rows,
+                        A.nnz()
+                    };
+                    append_diffusion_report(diffusion_report_path, record, false);
+
+                    // Write sample
+                    if (args_.use_npy) {
+                        if (!npy_theta_cnn_dir.empty()) {
+                            write_sample_npz_theta_cnn(A, h, theta, rho, npy_theta_cnn_dir, current,
+                                                       pattern_id, epsilon, refinement, iterations);
+                        }
+                        if (!npy_theta_gnn_dir.empty()) {
+                            write_sample_npz_theta_gnn(A, h, theta, rho, npy_theta_gnn_dir, current,
+                                                       pattern_id, epsilon, refinement, iterations);
+                        }
+                        if (!npy_p_value_dir.empty()) {
+                            write_sample_npz_p_value(A, h, theta, rho, npy_p_value_dir, current,
+                                                     pattern_id, epsilon, refinement, iterations);
+                        }
+                    } else {
+                        write_sample(A, h, theta, rho,
+                                    theta_cnn_file, theta_gnn_file, p_value_file);
                     }
-                    if (!npy_theta_gnn_dir.empty()) {
-                        write_sample_npz_theta_gnn(A, h, theta, rho, npy_theta_gnn_dir, current);
-                    }
-                    if (!npy_p_value_dir.empty()) {
-                        write_sample_npz_p_value(A, h, theta, rho, npy_p_value_dir, current);
-                    }
-                } else {
-                    write_sample(A, h, theta, rho,
-                                theta_cnn_file, theta_gnn_file, p_value_file);
-                }
 
-                current++;
-                if (args_.verbose && current % 100 == 0) {
-                    print_progress(current, total, start_time);
+                    current++;
+                    if (args_.verbose && current % 100 == 0) {
+                        print_progress(current, total, start_time);
+                    }
                 }
             }
         }
@@ -972,6 +1113,7 @@ void UnifiedAMGDataGenerator::generate_elastic() {
 }
 
 void UnifiedAMGDataGenerator::generate_stokes() {
+#ifdef DEAL_II_WITH_P4EST
     FEMScaleConfig config = ConfigFactory::get_stokes_config(args_.scale, args_.split);
 
     int total = config.total_samples();
@@ -1071,6 +1213,12 @@ void UnifiedAMGDataGenerator::generate_stokes() {
         close_output_files(theta_cnn_file, theta_gnn_file, p_value_file);
     }
     print_final_summary(current, start_time);
+#else
+    throw std::runtime_error(
+        "Stokes generation requires a deal.II build with p4est support "
+        "(DEAL_II_WITH_P4EST). Use a p4est-enabled deal.II install or choose another problem type."
+    );
+#endif
 }
 
 void UnifiedAMGDataGenerator::generate_graph_laplacian() {
@@ -1292,11 +1440,11 @@ void print_help() {
 
     std::cout << "Required Arguments:\n";
     std::cout << "  -p, --problem TYPE        Problem type: D|E|S|GL|SC\n";
-    std::cout << "  -s, --split SPLIT         Dataset split: train|test\n";
     std::cout << "  -f, --format FORMAT       Output format: theta-cnn|theta-gnn|p-value|all\n";
-    std::cout << "  -c, --scale SCALE         Dataset scale: small|medium|large|xlarge\n\n";
+    std::cout << "  -c, --scale SCALE         Dataset scale: small|large|paper\n\n";
 
     std::cout << "Optional Arguments:\n";
+    std::cout << "  -s, --split SPLIT         Legacy split for non-diffusion data: train|test\n";
     std::cout << "  -o, --output-dir DIR      Output directory (default: ./datasets/unified)\n";
     std::cout << "  -t NUM         OpenMP threads (default: auto)\n";
     std::cout << "  --seed SEED               Random seed (default: 42)\n";
@@ -1305,21 +1453,21 @@ void print_help() {
     std::cout << "  -h, --help                Show this help message\n\n";
 
     std::cout << "Problem Types:\n";
-    std::cout << "  D  - Diffusion equations (uniform coefficient)\n";
+    std::cout << "  D  - Diffusion equations (piecewise-constant coefficient patterns)\n";
     std::cout << "  E  - Elastic equations (linear elasticity)\n";
     std::cout << "  S  - Stokes equations (incompressible flow)\n";
     std::cout << "  GL - Graph Laplacian (Delaunay with lognormal weights)\n";
     std::cout << "  SC - Spectral Clustering (k-NN graphs)\n\n";
 
     std::cout << "Examples:\n";
-    std::cout << "  # Generate small diffusion training set in theta-cnn format\n";
-    std::cout << "  ./generate_amg_data -p D -s train -f theta-cnn -c small\n\n";
+    std::cout << "  # Generate small diffusion dataset in theta-cnn format\n";
+    std::cout << "  ./generate_amg_data -p D -f theta-cnn -c small\n\n";
 
-    std::cout << "  # Generate xlarge graph Laplacian test set in all formats\n";
-    std::cout << "  ./generate_amg_data -p GL -s test -f all -c xlarge -t 16\n\n";
+    std::cout << "  # Generate paper graph Laplacian test set in all formats\n";
+    std::cout << "  ./generate_amg_data -p GL -s test -f all -c paper -t 16\n\n";
 
-    std::cout << "  # Generate medium elastic training with custom output\n";
-    std::cout << "  ./generate_amg_data -p E -s train -f p-value -c medium -o custom_data\n\n";
+    std::cout << "  # Generate large elastic training with custom output\n";
+    std::cout << "  ./generate_amg_data -p E -s train -f p-value -c large -o custom_data\n\n";
 
     std::cout << "========================================\n\n";
 }
@@ -1359,6 +1507,7 @@ bool parse_arguments(int argc, char* argv[], CommandLineArgs& args) {
             std::string split = argv[i];
             if (split == "train") args.split = DatasetSplit::TRAIN;
             else if (split == "test") args.split = DatasetSplit::TEST;
+            else if (split == "all") args.split = DatasetSplit::ALL;
             else {
                 std::cerr << "Error: Invalid split: " << split << std::endl;
                 return false;
@@ -1388,11 +1537,11 @@ bool parse_arguments(int argc, char* argv[], CommandLineArgs& args) {
             }
             std::string scale = argv[i];
             if (scale == "small") args.scale = DatasetScale::SMALL;
-            else if (scale == "medium") args.scale = DatasetScale::MEDIUM;
             else if (scale == "large") args.scale = DatasetScale::LARGE;
-            else if (scale == "xlarge") args.scale = DatasetScale::XLARGE;
+            else if (scale == "paper") args.scale = DatasetScale::PAPER;
             else {
                 std::cerr << "Error: Invalid scale: " << scale << std::endl;
+                std::cerr << "Valid scales: small|large|paper" << std::endl;
                 return false;
             }
             has_scale = true;
@@ -1430,10 +1579,19 @@ bool parse_arguments(int argc, char* argv[], CommandLineArgs& args) {
         }
     }
 
-    if (!has_problem || !has_split || !has_format || !has_scale) {
+    if (!has_problem || !has_format || !has_scale) {
         std::cerr << "Error: Missing required arguments" << std::endl;
         print_help();
         return false;
+    }
+    if (args.problem != ProblemType::DIFFUSION && !has_split) {
+        std::cerr << "Error: Non-diffusion datasets still require -s/--split train|test" << std::endl;
+        print_help();
+        return false;
+    }
+    if (args.problem == ProblemType::DIFFUSION && has_split) {
+        std::cout << "Note: diffusion generation is unsplit; ignoring -s/--split for output layout.\n";
+        args.split = DatasetSplit::ALL;
     }
 
     return true;
@@ -1444,7 +1602,7 @@ void print_configuration(const CommandLineArgs& args) {
     std::cout << "========================================\n";
     std::cout << "Configuration\n";
     std::cout << "Problem type: " << problem_type_to_string(args.problem) << "\n";
-    std::cout << "Dataset split: " << (args.split == DatasetSplit::TRAIN ? "train" : "test") << "\n";
+    std::cout << "Dataset split: " << split_to_string(args.split) << "\n";
     std::cout << "Output format: ";
     switch (args.format) {
         case OutputFormat::THETA_CNN: std::cout << "theta-cnn"; break;
@@ -1467,6 +1625,14 @@ void print_configuration(const CommandLineArgs& args) {
 
 
 int main(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_help();
+            return 0;
+        }
+    }
+
     // Initialize MPI (needed for FEM solvers)
     dealii::Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
 

@@ -187,12 +187,16 @@ Optional Arguments:
 
 #### FEM Problems (D, E, S)
 
-| Scale | Diffussion | Elastic | Stokes | Use Case |
+| Scale | Diffusion | Elastic | Stokes | Use Case |
 |-------|-----------|-----------|-----------|----------|
-| **small** | 50 | 60 | 60 | Quick testing |
-| **medium** | 450 | 540 | 1,080 | Validation |
-| **large** | 1,800 | 1,500 | 1,800 | Full training |
-| **xlarge** | 2,560 | 4,480 | 7,680 | Production |
+| **small** | 200 | 60 | 60 | Quick testing |
+| **medium** | 1,800 | 540 | 1,080 | Validation |
+| **large** | 7,200 | 1,500 | 1,800 | Full training |
+| **xlarge** | 2,400 | 4,480 | 7,680 | Production |
+
+For diffusion, the generator now includes the four piecewise-constant coefficient patterns from the paper:
+left/right split, 2×2 checkerboard, four vertical stripes, and 4×4 checkerboard.
+The xlarge diffusion grid is aligned with the paper-style table setup: 25 epsilon values, 8 mesh sizes, and 3 theta values.
 
 #### Graph Problems (Graph Laplacian, Spectral Clustering)
 
@@ -250,6 +254,14 @@ datasets/unified/
 └── test/raw/
     └── (same structure as train)
 ```
+
+Diffusion runs are additionally isolated by size under:
+`datasets/unified/diffusion/<small|medium|large|xlarge>/<train|test>/raw/`
+with `theta_cnn_npy/`, `theta_gnn_npy/`, `p_value_npy/`, and `diffusion_reports/` inside each scale folder.
+
+Generated analysis artifacts now go under the top-level `reports/` directory, with subfolders such as
+`reports/theta_rho_relation/`, `reports/theta_levels_relation/`, `reports/theta_solver_times/`, and
+`reports/time_vs_rho/`.
 
 ---
 
@@ -327,7 +339,7 @@ datasets/unified/
     'edge_attr': (num_edges,),         # Edge values
     'theta': scalar,                    # Theta parameter
     'y': scalar,                        # rho (convergence factor)
-    'metadata': [n, rho, h, epsilon]   # Problem metadata
+    'metadata': [n, rho, h, epsilon, pattern_id, refinement, iterations]
 }
 ```
 
@@ -338,7 +350,7 @@ datasets/unified/
     'coarse_nodes',                           # C/F splitting
     'P_values', 'P_row_ptr', 'P_col_idx',    # Prolongation matrix (CSR)
     'S_values', 'S_row_ptr', 'S_col_idx',    # Smoother matrix (CSR)
-    'metadata': [n, theta, rho, h]            # Problem metadata
+    'metadata': [n, theta, rho, h, pattern_id, epsilon, refinement, iterations]
 }
 ```
 
@@ -348,6 +360,7 @@ datasets/unified/
 - CSV loaders still work (omit `--use-npy` flag)
 - Can mix CSV and NPY in different experiments
 - NPY recommended for all training work
+- Diffusion outputs are saved per scale, so use the scale-specific diffusion root when loading those datasets
 
 **Converting Workflow:**
 1. Regenerate datasets with NPZ format
@@ -368,6 +381,8 @@ source venv/bin/activate
 python train_stage1.py \
 --model GNN \
 --dataset datasets/unified \
+--problem-type D \
+--diffusion-scale small \
 --train-file train_D \
 --test-file test_D \
 --use-npy \
@@ -386,6 +401,8 @@ python train_stage1.py \
 python train_stage1.py \
 --model CNN \
 --dataset datasets/unified \
+--problem-type D \
+--diffusion-scale small \
 --train-file train_D.csv \
 --test-file test_D.csv \
 --epochs 50 \
@@ -408,6 +425,8 @@ source venv/bin/activate
 # If you want to try different datasets, just change the arguments
 python train_stage2.py \
 --dataset datasets/unified \
+--problem-type D \
+--diffusion-scale small \
 --train-file train_D \
 --test-file test_D \
 --use-npy \
@@ -432,12 +451,16 @@ python train_stage2.py \
 python evaluate.py --model weights/D_stage1_cnn/D_stage1_cnn/best_model.pt \
 --model-type stage1_cnn \
 --dataset datasets/unified \
+--problem-type D \
+--diffusion-scale small \
 --test-file test_D 
 --use-npy
 
 python evaluate.py --model weights/D_stage1_gnn/D_stage1_gnn/best_model.pt \
 --model-type stage1_gnn \
 --dataset datasets/unified \
+--problem-type D \
+--diffusion-scale small \
 --test-file test_D 
 --use-npy
 
@@ -446,6 +469,8 @@ python evaluate.py --model weights/D_stage1_gnn/D_stage1_gnn/best_model.pt \
  python evaluate.py --model weights/D_stage2_pvalue/D_stage2_pvalue/best_model.pt \
  --model-type stage2 \
  --dataset datasets/unified \
+ --problem-type D \
+ --diffusion-scale small \
  --test-file test_D \
  --use-npy
 
