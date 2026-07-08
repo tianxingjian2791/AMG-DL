@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 # Project name
-project(PACSProject LANGUAGES C CXX)
+project(PACSProject LANGUAGES CXX)
 
 # ============================================================================
 # Find deal.II
@@ -24,7 +24,17 @@ message(STATUS "Found Eigen3: ${EIGEN3_INCLUDE_DIR}")
 # ============================================================================
 # Find OpenMP
 # ============================================================================
-find_package(OpenMP REQUIRED)
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  execute_process(
+    COMMAND brew --prefix libomp
+    OUTPUT_VARIABLE LIBOMP_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+  set(OpenMP_CXX_LIB_NAMES "omp")
+  set(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+endif()
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 if(OpenMP_CXX_FOUND)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 endif()
@@ -71,7 +81,7 @@ message(STATUS "  Eigen3: ${EIGEN3_INCLUDE_DIR}")
 message(STATUS "  OpenMP: ${OpenMP_CXX_FLAGS}")
 message(STATUS "")
 message(STATUS "Usage example:")
-message(STATUS "  ./generate_amg_data -p D -s train -f all -c medium")
+message(STATUS "  ./generate_amg_data -p D -f all -c large --use-npy")
 message(STATUS "")
 message(STATUS "Run './generate_amg_data --help' for full options")
 message(STATUS "========================================")

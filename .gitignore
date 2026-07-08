@@ -1,0 +1,9 @@
+/build
+/datasets
+/logs
+/weights
+/results
+
+
+/.matplotlib-cache
+*__pycache__
