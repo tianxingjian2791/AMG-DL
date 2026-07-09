@@ -1,0 +1,30 @@
+# Standalone build for polydg_amg_solve — HYPRE BoomerAMG solver binary.
+# Uses only deal.II (no Polydeal); requires DEAL_II_WITH_PETSC=ON.
+#
+# Build on the cluster:
+#   mkdir -p /work/u11052485/amg_solve_build
+#   cd       /work/u11052485/amg_solve_build
+#   cmake ~/share/PACSProject/polydeal_driver \
+#         -DCMAKE_BUILD_TYPE=Release \
+#         -DCMAKELIST_FILE=CMakeLists_amg_solve.txt
+#   # (or just rename this file to CMakeLists.txt before running cmake)
+#   make -j8
+#   # binary is ./polydg_amg_solve
+
+cmake_minimum_required(VERSION 3.13)
+project(polydg_amg_solve CXX)
+
+find_package(deal.II 9.5 REQUIRED
+  HINTS ${deal.II_DIR} $ENV{DEAL_II_DIR} /usr/share/cmake/deal.II)
+
+if(NOT DEAL_II_WITH_PETSC)
+  message(FATAL_ERROR
+    "deal.II was not built with PETSc support.\n"
+    "polydg_amg_solve requires PETSc for PreconditionBoomerAMG.\n"
+    "Check /usr/share/cmake/deal.II/deal.IIConfig.cmake.")
+endif()
+
+deal_ii_initialize_cached_variables()
+
+add_executable(polydg_amg_solve polydg_amg_solve.cc)
+deal_ii_setup_target(polydg_amg_solve)
