@@ -4,6 +4,7 @@
 /weights
 /results
 
-
+.DS_Store
+/.claude
 /.matplotlib-cache
 *__pycache__

@@ -174,7 +174,34 @@ Optional Arguments:
   -v, --verbose             Verbose progress output
   -h, --help                Show help message
   --use-npy                 Store data in NPZ format (default: CSV format)
+  -e, --cell-type TYPE      Mesh cell type, Diffusion only: quad|simplex (default: quad)
 ```
+
+### Mesh Cell Type (Diffusion only)
+
+By default, `-p D` discretizes the domain with quadrilateral cells
+(`GridGenerator::hyper_cube` + uniform `refine_global`). Passing
+`-e simplex`/`--cell-type simplex` switches to a triangular mesh
+(`GridGenerator::subdivided_hyper_cube_with_simplices` with `FE_SimplexP`,
+`QGaussSimplex`, and `MappingFE`) instead, using the same number of
+subdivisions per side as the quad path at the same `refinement` level.
+Simplex-mode output is written under an extra `simplex/` path segment so it
+never collides with quad datasets, e.g.:
+
+```bash
+# Quad (default) -- unchanged paths
+./build/generate_amg_data -p D -f theta-gnn -c small --use-npy
+# -> datasets/unified/diffusion/small/theta_gnn_npy/D/
+
+# Simplex (triangle) cells
+./build/generate_amg_data -p D -f theta-gnn -c small --use-npy -e simplex
+# -> datasets/unified/diffusion/small/simplex/theta_gnn_npy/D/
+```
+
+`-e/--cell-type` is only supported for Diffusion; it's ignored (with a note)
+for other problem types, since Elastic's adaptive mesh refinement and
+Stokes's p4est-backed parallel triangulation aren't compatible with simplex
+cells in this deal.II version.
 
 ### Output Formats
 

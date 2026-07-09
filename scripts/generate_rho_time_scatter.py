@@ -19,7 +19,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from utils.data import SampleRecordRepository
 
 
-DEFAULT_INPUT_GLOB = "datasets/diffusion/large/**/raw/diffusion_reports/*.csv"
+DEFAULT_INPUT_GLOB = "datasets/diffusion/large/**/diffusion_reports/*.csv"
 DEFAULT_H_VALUES = (
     0.125,
     0.0625,
@@ -54,9 +54,13 @@ class Point:
 
 
 def parse_floats(raw: str, default: tuple[float, ...]) -> tuple[float, ...]:
-    if not raw:
+    if not raw or raw.strip().lower() == "auto":
         return default
     return tuple(float(v.strip()) for v in raw.split(",") if v.strip())
+
+
+def available_h_values(points: list[Point]) -> tuple[float, ...]:
+    return tuple(sorted({point.h for point in points}, reverse=True))
 
 
 def load_points(input_glob: str) -> tuple[list[Point], list[str]]:
@@ -240,20 +244,28 @@ def main() -> None:
     )
     parser.add_argument("--input-glob", default=DEFAULT_INPUT_GLOB)
     parser.add_argument("--out-dir", default="results/figures/rho_time_scatter")
-    parser.add_argument("--h-values", default=",".join(str(v) for v in DEFAULT_H_VALUES))
+    parser.add_argument("--h-values", default="auto")
     parser.add_argument("--png-name", default="rho_time_scatter_large.png")
     parser.add_argument("--csv-name", default="rho_time_scatter_large.csv")
     parser.add_argument("--png-scale", type=int, default=3)
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
-    h_values = parse_floats(args.h_values, DEFAULT_H_VALUES)
-    h_set = {round(v, 8) for v in h_values}
-
     points, paths = load_points(args.input_glob)
+    all_h_values = available_h_values(points)
+    h_values = parse_floats(args.h_values, all_h_values or DEFAULT_H_VALUES)
+    h_set = {round(v, 8) for v in h_values}
     points = [point for point in points if round(point.h, 8) in h_set]
     if not points:
-        raise ValueError("No compatible points found for the requested h values.")
+        if not all_h_values:
+            raise ValueError("No compatible points found in the input reports.")
+        print("WARNING: requested h values had no compatible points; using all available h values.")
+        h_values = all_h_values
+        h_set = {round(v, 8) for v in h_values}
+        points, _ = load_points(args.input_glob)
+        points = [point for point in points if round(point.h, 8) in h_set]
+        if not points:
+            raise ValueError("No compatible points found after falling back to all available h values.")
 
     points, norm_rho, norm_time, skipped, used_groups = normalize_by_test_case(points)
     if not points:
@@ -269,9 +281,13 @@ def main() -> None:
     csv_path = out_dir / args.csv_name
     png_path = out_dir / args.png_name
     write_csv(csv_path, points, norm_rho, norm_time)
-    write_png(png_path, points, norm_rho, norm_time, h_values, max(1, args.png_scale))
     print(f"Wrote {csv_path}")
-    print(f"Wrote {png_path}")
+    try:
+        write_png(png_path, points, norm_rho, norm_time, h_values, max(1, args.png_scale))
+    except RuntimeError as exc:
+        print(f"WARNING: could not write {png_path}: {exc}")
+    else:
+        print(f"Wrote {png_path}")
 
 
 if __name__ == "__main__":

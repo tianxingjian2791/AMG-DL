@@ -28,7 +28,10 @@
 #include <deal.II/dofs/dof_tools.h>
 
 #include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/fe_simplex_p.h>
 #include <deal.II/fe/fe_values.h>
+#include <deal.II/fe/mapping_fe.h>
+#include <deal.II/fe/mapping_q1.h>
 
 #include <deal.II/numerics/vector_tools.h>
 #include <deal.II/numerics/matrix_tools.h>
@@ -39,6 +42,7 @@
 #include <cmath>
 #include <array>
 #include <chrono>
+#include <memory>
 
 #include "AMGOperators.hpp"
 
@@ -215,8 +219,8 @@ namespace AMGDiffusion
   class Solver
   {
   public:
-    Solver(DiffusionPattern pattern, double epsilon, unsigned int refinement);
-    Solver(double epsilon, unsigned int refinement);
+    Solver(DiffusionPattern pattern, double epsilon, unsigned int refinement, bool use_simplex = false);
+    Solver(double epsilon, unsigned int refinement, bool use_simplex = false);
     void set_pattern(DiffusionPattern pattern);
     void set_theta(double theta);
     void set_epsilon(double epsilon);
@@ -268,6 +272,7 @@ namespace AMGDiffusion
     double theta;
     double epsilon;
     unsigned int refinement;
+    bool use_simplex;  // false = quad cells (default), true = triangle cells
     OutputFormat output_format;
 
     // Convergence metrics (to be stored after solve)
@@ -279,7 +284,8 @@ namespace AMGDiffusion
 
     // Grids and finite elements
     dealii::Triangulation<dim> triangulation;
-    dealii::FE_Q<dim> fe;
+    std::unique_ptr<dealii::FiniteElement<dim>> fe;
+    std::unique_ptr<dealii::Mapping<dim>> mapping;
     dealii::DoFHandler<dim> dof_handler;
     dealii::SolverControl solver_control; // solver controller
 
@@ -297,34 +303,59 @@ namespace AMGDiffusion
   };
 
   template <int dim>
-  Solver<dim>::Solver(DiffusionPattern pattern, double epsilon, unsigned int refinement)
+  Solver<dim>::Solver(DiffusionPattern pattern, double epsilon, unsigned int refinement, bool use_simplex)
     : pattern(pattern)
     , epsilon(epsilon)
     , refinement(refinement)
+    , use_simplex(use_simplex)
     , output_format(OutputFormat::THETA_GNN) // default format
     , convergence_factor(1.0)
     , mesh_size_h(0.0)
     , solver_iterations(0)
     , amg_hierarchy_levels(0)
-    , fe(1) // Q1 FE
     , dof_handler(triangulation)
     , solver_control(1000, 1e-12) // max iterations is 1000，tolerance is 1e-12
     , exact_solution(pattern)
     , right_hand_side(pattern)
     , diffusion_coefficient(pattern, epsilon)
-  {}
+  {
+    if (use_simplex)
+      {
+        // Triangle cells (P1 Lagrange), with an isoparametric mapping built
+        // from the same element, as in deal.II's step_3_simplex tutorial.
+        fe = std::make_unique<dealii::FE_SimplexP<dim>>(1);
+        mapping = std::make_unique<dealii::MappingFE<dim>>(dealii::FE_SimplexP<dim>(1));
+      }
+    else
+      {
+        // Quad cells (Q1 Lagrange) -- unchanged default behavior.
+        fe = std::make_unique<dealii::FE_Q<dim>>(1);
+        mapping = std::make_unique<dealii::MappingQ1<dim>>();
+      }
+  }
 
   template <int dim>
-  Solver<dim>::Solver(double epsilon, unsigned int refinement)
-    : Solver(DiffusionPattern::VERTICAL_STRIPES, epsilon, refinement)
+  Solver<dim>::Solver(double epsilon, unsigned int refinement, bool use_simplex)
+    : Solver(DiffusionPattern::VERTICAL_STRIPES, epsilon, refinement, use_simplex)
   {}
 
   template <int dim>
   void Solver<dim>::make_grid()
   {
-    // Generate square grids
-    GridGenerator::hyper_cube(triangulation, -1.0, 1.0);
-    triangulation.refine_global(refinement);
+    if (use_simplex)
+      {
+        // Triangle mesh: subdivide the square into `2^refinement` cells per
+        // side (each further split into simplices), matching the number of
+        // subdivisions the quad path gets from refine_global(refinement).
+        GridGenerator::subdivided_hyper_cube_with_simplices(
+          triangulation, 1u << refinement, -1.0, 1.0);
+      }
+    else
+      {
+        // Generate square grids
+        GridGenerator::hyper_cube(triangulation, -1.0, 1.0);
+        triangulation.refine_global(refinement);
+      }
 
     // Store the cell side length used as h in the paper tables.
     mesh_size_h = GridTools::maximal_cell_diameter(triangulation) / std::sqrt(dim);
@@ -369,7 +400,7 @@ namespace AMGDiffusion
   void Solver<dim>::setup_system()
   {
     // Setup dofs
-    dof_handler.distribute_dofs(fe);
+    dof_handler.distribute_dofs(*fe);
     // std::cout << "Number of degrees of freedom: " << dof_handler.n_dofs() << std::endl;
 
     // Initialize MPI variables
@@ -392,7 +423,8 @@ namespace AMGDiffusion
     constraints.clear();
     constraints.reinit(locally_relevant_dofs);
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
-    VectorTools::interpolate_boundary_values(dof_handler,
+    VectorTools::interpolate_boundary_values(*mapping,
+                                            dof_handler,
                                             0,
                                             exact_solution,
                                             constraints);
@@ -402,14 +434,20 @@ namespace AMGDiffusion
   template <int dim>
   void Solver<dim>::assemble_system()
   {
-    QGauss<dim> quadrature_formula(fe.degree + 1);
-    FEValues<dim> fe_values(fe,
-                           quadrature_formula,
+    std::unique_ptr<Quadrature<dim>> quadrature_formula;
+    if (use_simplex)
+      quadrature_formula = std::make_unique<QGaussSimplex<dim>>(fe->degree + 1);
+    else
+      quadrature_formula = std::make_unique<QGauss<dim>>(fe->degree + 1);
+
+    FEValues<dim> fe_values(*mapping,
+                           *fe,
+                           *quadrature_formula,
                            update_values | update_gradients |
                            update_JxW_values | update_quadrature_points);
 
-    const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
-    const unsigned int n_q_points = quadrature_formula.size();
+    const unsigned int dofs_per_cell = fe->n_dofs_per_cell();
+    const unsigned int n_q_points = quadrature_formula->size();
 
     FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
     Vector<double> cell_rhs(dofs_per_cell);

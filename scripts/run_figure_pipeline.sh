@@ -19,8 +19,8 @@ compiles generated .tex files to PDF when possible.
 USAGE
 }
 
-dataset_root="datasets/diffusion/large"
-output_root="results/figures"
+dataset_root="datasets/diffusion/poly/"
+output_root="results/figures/polysiks/large"
 compile_pdf=1
 
 while [[ $# -gt 0 ]]; do
@@ -52,9 +52,10 @@ done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-report_glob="${dataset_root%/}/**/raw/diffusion_reports/*.csv"
+report_glob="${dataset_root%/}/**/diffusion_reports/*.csv"
 mkdir -p "$output_root"
 failures=0
+compile_failures=0
 
 echo "Dataset root: $dataset_root"
 echo "Output root:  $output_root"
@@ -96,7 +97,7 @@ compile_tex_tree() {
       echo "Wrote ${tex_file%.tex}.pdf"
     else
       echo "WARNING: Failed to compile $tex_file. Check ${tex_file%.tex}.log." >&2
-      failures=$((failures + 1))
+      compile_failures=$((compile_failures + 1))
     fi
     echo
   done < <(find "$root" -name '*.tex' -type f | sort)
@@ -129,6 +130,9 @@ if [[ "$compile_pdf" -eq 1 ]]; then
 fi
 
 echo "Done. Outputs are under $output_root"
+if [[ "$compile_failures" -gt 0 ]]; then
+  echo "PDF compilation completed with $compile_failures warning(s)." >&2
+fi
 if [[ "$failures" -gt 0 ]]; then
   echo "Completed with $failures failure(s)." >&2
   exit 1

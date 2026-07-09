@@ -53,10 +53,10 @@ def parse_args():
     parser.add_argument('--use-npy', action='store_true',
                       help='Use NPY/NPZ format instead of CSV (5× faster)')
     parser.add_argument('--split-policy', type=str, default='test_case',
-                      choices=['test_case', 'sample', 'h', 'epsilon'],
-                      help='Split policy for unsplit NPZ datasets')
+                      choices=['test_case', 'sample', 'h', 'epsilon', 'h_theta'],
+                      help='Split policy for unsplit NPZ datasets (CSV CNN loader only supports sample/h_theta)')
     parser.add_argument('--train-ratio', type=float, default=0.8,
-                      help='Training ratio for unsplit NPZ datasets')
+                      help='Training ratio for unsplit NPZ/CSV datasets')
 
     # Training configuration
     parser.add_argument('--epochs', type=int, default=50,
@@ -163,32 +163,60 @@ def create_dataloaders(args):
                 train_ratio=args.train_ratio
             )
         else:
-            # CNN with CSV format (legacy)
-            from data import create_dataloaders as create_cnn_loaders
-
+            # CNN with CSV format
             train_path = os.path.join(args.dataset, 'train', 'raw', 'theta_cnn', args.train_file)
             test_path = os.path.join(args.dataset, 'test', 'raw', 'theta_cnn', args.test_file)
 
-            # For CNN, we need CSVDataset
-            from data.cnn_data_processing import CSVDataset
-            from torch.utils.data import DataLoader
+            if os.path.exists(train_path) and os.path.exists(test_path):
+                # Pre-split legacy layout: separate train/ and test/ CSVs already on disk
+                from data.cnn_data_processing import CSVDataset
+                from torch.utils.data import DataLoader
 
-            train_dataset = CSVDataset(train_path)
-            test_dataset = CSVDataset(test_path)
+                train_dataset = CSVDataset(train_path)
+                test_dataset = CSVDataset(test_path)
 
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=args.num_workers
-            )
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    num_workers=args.num_workers
+                )
 
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=args.num_workers
-            )
+                test_loader = DataLoader(
+                    test_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=args.num_workers
+                )
+            else:
+                # Unsplit single CSV (e.g. datasets/diffusion/large/quad/diffusion_reports):
+                # split rows into train/test inside the dataloader.
+                unsplit_path = os.path.join(args.dataset, 'theta_cnn', args.train_file)
+                if not os.path.exists(unsplit_path):
+                    unsplit_path = os.path.join(args.dataset, args.train_file)
+                if not os.path.exists(unsplit_path):
+                    raise FileNotFoundError(
+                        "Could not find a pre-split train/test CSV pair or an unsplit "
+                        f"theta_cnn CSV. Checked:\n  {train_path}\n  {test_path}\n  {unsplit_path}"
+                    )
+
+                split_policy = args.split_policy if args.split_policy in ('sample', 'h_theta') else 'sample'
+                if args.split_policy not in ('sample', 'h_theta'):
+                    print(
+                        f"Warning: split-policy '{args.split_policy}' is not supported for the "
+                        f"unsplit CSV CNN loader, falling back to 'sample'."
+                    )
+
+                from data.cnn_data_processing import create_theta_cnn_dataloaders_from_csv
+
+                train_loader, test_loader = create_theta_cnn_dataloaders_from_csv(
+                    unsplit_path,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    train_ratio=args.train_ratio,
+                    seed=args.seed,
+                    split_policy=split_policy
+                )
 
     else:  # GNN
         # GNN supports both CSV and NPY formats
