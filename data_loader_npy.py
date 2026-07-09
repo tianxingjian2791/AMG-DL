@@ -2,11 +2,97 @@
 Optimized data loaders supporting both CSV and NPY/NPZ formats
 """
 
+import glob
 import os
+from collections import defaultdict
+
 import numpy as np
 import torch
 from torch_geometric.data import Data, Dataset
-import glob
+
+
+def _metadata_key_from_npz(path, layout, split_policy):
+    if split_policy == "sample":
+        return os.path.basename(path)
+
+    data = np.load(path)
+    metadata = data["metadata"]
+
+    if layout == "theta_gnn":
+        h = float(metadata[2])
+        epsilon = float(metadata[3]) if len(metadata) > 3 else 0.0
+        pattern_id = int(metadata[4]) if len(metadata) > 4 else -1
+        refinement = int(metadata[5]) if len(metadata) > 5 else -1
+    else:
+        h = float(metadata[2] if layout == "theta_cnn" else metadata[3])
+        pattern_id = int(metadata[4]) if len(metadata) > 4 else -1
+        epsilon = float(metadata[5]) if len(metadata) > 5 else 0.0
+        refinement = int(metadata[6]) if len(metadata) > 6 else -1
+
+    if split_policy == "test_case":
+        return (round(h, 15), round(epsilon, 15), pattern_id, refinement)
+    if split_policy == "h":
+        return round(h, 15)
+    if split_policy == "epsilon":
+        return round(epsilon, 15)
+
+    raise ValueError(
+        f"Unknown split policy '{split_policy}'. "
+        "Use one of: test_case, sample, h, epsilon."
+    )
+
+
+def _split_sample_files(sample_files, layout, split_policy, train_ratio, seed):
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError("train_ratio must be between 0 and 1.")
+
+    groups = defaultdict(list)
+    for path in sample_files:
+        groups[_metadata_key_from_npz(path, layout, split_policy)].append(path)
+
+    keys = sorted(groups)
+    if len(keys) < 2:
+        raise ValueError(
+            f"Need at least two {split_policy} group(s) to create a train/test split; "
+            f"found {len(keys)}."
+        )
+    rng = np.random.default_rng(seed)
+    rng.shuffle(keys)
+    split_at = max(1, min(len(keys) - 1, int(round(len(keys) * train_ratio))))
+
+    train_keys = set(keys[:split_at])
+    train_files = []
+    test_files = []
+    for key, paths in groups.items():
+        if key in train_keys:
+            train_files.extend(paths)
+        else:
+            test_files.extend(paths)
+
+    return sorted(train_files), sorted(test_files), len(groups)
+
+
+def _resolve_npy_paths(dataset_root, subdir, train_problem, test_problem):
+    legacy_train = os.path.join(dataset_root, "train", "raw", subdir, train_problem)
+    legacy_test = os.path.join(dataset_root, "test", "raw", subdir, test_problem)
+    if os.path.exists(legacy_train) and os.path.exists(legacy_test):
+        return "legacy", legacy_train, legacy_test
+
+    problem = test_problem
+    for prefix in ("train_", "test_"):
+        if problem.startswith(prefix):
+            problem = problem[len(prefix):]
+    unsplit = os.path.join(dataset_root, "raw", subdir, problem)
+    if os.path.exists(unsplit):
+        return "unsplit", unsplit, unsplit
+
+    raise FileNotFoundError(
+        "NPY data not found. Checked legacy split paths:\n"
+        f"  {legacy_train}\n"
+        f"  {legacy_test}\n"
+        "and unsplit path:\n"
+        f"  {unsplit}\n"
+    )
 
 class GNNThetaDatasetNPY(Dataset):
     """
@@ -16,13 +102,14 @@ class GNNThetaDatasetNPY(Dataset):
         - edge_index: (2, num_edges)
         - edge_attr: (num_edges,)
         - y: scalar theta value
-        - metadata: [n, rho, h, epsilon]
+        - metadata: [n, rho, h, epsilon, pattern_id, refinement, iterations]
     """
 
-    def __init__(self, root, transform=None, pre_transform=None):
+    def __init__(self, root, transform=None, pre_transform=None, sample_files=None):
         self.root = root
-        # Find all npz files
-        self.sample_files = sorted(glob.glob(os.path.join(root, "sample_*.npz")))
+        self.sample_files = sorted(
+            sample_files if sample_files is not None else glob.glob(os.path.join(root, "sample_*.npz"))
+        )
 
         if len(self.sample_files) == 0:
             raise ValueError(f"No NPZ files found in {root}")
@@ -62,6 +149,10 @@ class GNNThetaDatasetNPY(Dataset):
         # Get number of nodes from metadata
         num_nodes = int(metadata[0])
         h = metadata[2]
+        epsilon = float(metadata[3]) if len(metadata) > 3 else 0.0
+        pattern_id = int(metadata[4]) if len(metadata) > 4 else -1
+        refinement = int(metadata[5]) if len(metadata) > 5 else -1
+        iterations = int(metadata[6]) if len(metadata) > 6 else -1
 
         # Calculate node features (degree)
         degrees = torch.zeros(num_nodes, dtype=torch.float)
@@ -77,7 +168,11 @@ class GNNThetaDatasetNPY(Dataset):
             y=y,
             theta=theta,
             log_h=-torch.log2(torch.tensor([h], dtype=torch.float)),
-            num_nodes=num_nodes
+            num_nodes=num_nodes,
+            epsilon=torch.tensor([epsilon], dtype=torch.float),
+            pattern_id=torch.tensor([pattern_id], dtype=torch.long),
+            refinement=torch.tensor([refinement], dtype=torch.long),
+            iterations=torch.tensor([iterations], dtype=torch.long)
         )
 
 
@@ -88,7 +183,7 @@ class CNNThetaDatasetNPY(torch.utils.data.Dataset):
     Each npz file contains:
         - pooled_matrix: (50, 50) pooled matrix
         - y: rho (convergence factor) - CORRECTED after C++ fix
-        - metadata: [n, rho, h, theta]
+        - metadata: [n, rho, h, theta, pattern_id, epsilon, refinement, iterations]
 
     Returns:
         X: Concatenated tensor [theta, log_h, flattened_matrix] of shape (2502,)
@@ -98,11 +193,12 @@ class CNNThetaDatasetNPY(torch.utils.data.Dataset):
         y: rho (convergence factor) - the prediction target
     """
 
-    def __init__(self, root, transform=None):
+    def __init__(self, root, transform=None, sample_files=None):
         self.root = root
         self.transform = transform
-        # Find all npz files
-        self.sample_files = sorted(glob.glob(os.path.join(root, "sample_*.npz")))
+        self.sample_files = sorted(
+            sample_files if sample_files is not None else glob.glob(os.path.join(root, "sample_*.npz"))
+        )
 
         if len(self.sample_files) == 0:
             raise ValueError(f"No NPZ files found in {root}")
@@ -125,11 +221,15 @@ class CNNThetaDatasetNPY(torch.utils.data.Dataset):
         y_data = data['y']
         rho = float(y_data[0]) if y_data.ndim > 0 else float(y_data)
 
-        # Extract metadata: [n, rho, h, theta]
+        # Extract metadata: [n, rho, h, theta, pattern_id, epsilon, refinement, iterations]
         # Note: metadata[1] also contains rho, but we use data['y'] for consistency
         metadata = data['metadata']
         h = metadata[2]      # Mesh size
         theta = metadata[3]  # Strong threshold (input feature)
+        pattern_id = int(metadata[4]) if len(metadata) > 4 else -1
+        epsilon = float(metadata[5]) if len(metadata) > 5 else 0.0
+        refinement = int(metadata[6]) if len(metadata) > 6 else -1
+        iterations = int(metadata[7]) if len(metadata) > 7 else -1
 
         # Compute log_h (input feature)
         log_h = -np.log2(h)
@@ -166,12 +266,14 @@ class PValueDatasetNPY(Dataset):
         - coarse_nodes: coarse node indices
         - P_values, P_row_ptr, P_col_idx: CSR matrix P
         - S_values, S_row_ptr, S_col_idx: CSR matrix S
-        - metadata: [n, theta, rho, h]
+        - metadata: [n, theta, rho, h, pattern_id, epsilon, refinement, iterations]
     """
 
-    def __init__(self, root, transform=None, pre_transform=None):
+    def __init__(self, root, transform=None, pre_transform=None, sample_files=None):
         self.root = root
-        self.sample_files = sorted(glob.glob(os.path.join(root, "sample_*.npz")))
+        self.sample_files = sorted(
+            sample_files if sample_files is not None else glob.glob(os.path.join(root, "sample_*.npz"))
+        )
 
         if len(self.sample_files) == 0:
             raise ValueError(f"No NPZ files found in {root}")
@@ -211,6 +313,10 @@ class PValueDatasetNPY(Dataset):
         theta = float(metadata[1])
         rho = float(metadata[2])
         h = float(metadata[3])
+        pattern_id = int(metadata[4]) if len(metadata) > 4 else -1
+        epsilon = float(metadata[5]) if len(metadata) > 5 else 0.0
+        refinement = int(metadata[6]) if len(metadata) > 6 else -1
+        iterations = int(metadata[7]) if len(metadata) > 7 else -1
 
         # Reconstruct CSR matrix A
         A = csr_matrix(
@@ -300,6 +406,10 @@ class PValueDatasetNPY(Dataset):
         pyg_data.theta = torch.tensor([theta], dtype=torch.float)
         pyg_data.rho = torch.tensor([rho], dtype=torch.float)
         pyg_data.log_h = torch.tensor([-np.log2(h)], dtype=torch.float)
+        pyg_data.pattern_id = torch.tensor([pattern_id], dtype=torch.long)
+        pyg_data.epsilon = torch.tensor([epsilon], dtype=torch.float)
+        pyg_data.refinement = torch.tensor([refinement], dtype=torch.long)
+        pyg_data.iterations = torch.tensor([iterations], dtype=torch.long)
 
         # Store matrices as scipy sparse (accessed separately during training)
         pyg_data.A_sparse = A
@@ -316,7 +426,9 @@ class PValueDatasetNPY(Dataset):
 
 
 def create_theta_data_loaders_npy(dataset_root, train_problem='train_D', test_problem='test_D',
-                                  batch_size=32, num_workers=4):
+                                  batch_size=32, num_workers=4,
+                                  split_policy='test_case', split_seed=42,
+                                  train_ratio=0.8):
     """
     Create data loaders for NPY format theta_gnn dataset
 
@@ -325,22 +437,28 @@ def create_theta_data_loaders_npy(dataset_root, train_problem='train_D', test_pr
     """
     from torch_geometric.loader import DataLoader
 
-    # Paths to NPY directories
-    train_path = os.path.join(dataset_root, 'train', 'raw', 'theta_gnn_npy', train_problem)
-    test_path = os.path.join(dataset_root, 'test', 'raw', 'theta_gnn_npy', test_problem)
-
-    # Check if NPY data exists
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(
-            f"NPY data not found at {train_path}\n"
-        )
+    layout, train_path, test_path = _resolve_npy_paths(
+        dataset_root, 'theta_gnn_npy', train_problem, test_problem
+    )
 
     print(f"Loading NPY datasets from:")
     print(f"  Train: {train_path}")
     print(f"  Test: {test_path}")
 
-    train_dataset = GNNThetaDatasetNPY(train_path)
-    test_dataset = GNNThetaDatasetNPY(test_path)
+    if layout == "unsplit":
+        sample_files = sorted(glob.glob(os.path.join(train_path, "sample_*.npz")))
+        train_files, test_files, num_groups = _split_sample_files(
+            sample_files, "theta_gnn", split_policy, train_ratio, split_seed
+        )
+        print(
+            f"Created {split_policy} split from {num_groups} group(s), "
+            f"seed={split_seed}, train_ratio={train_ratio}"
+        )
+        train_dataset = GNNThetaDatasetNPY(train_path, sample_files=train_files)
+        test_dataset = GNNThetaDatasetNPY(test_path, sample_files=test_files)
+    else:
+        train_dataset = GNNThetaDatasetNPY(train_path)
+        test_dataset = GNNThetaDatasetNPY(test_path)
 
     train_loader = DataLoader(
         train_dataset,
@@ -360,7 +478,9 @@ def create_theta_data_loaders_npy(dataset_root, train_problem='train_D', test_pr
 
 
 def create_theta_cnn_data_loaders_npy(dataset_root, train_problem='train_D', test_problem='test_D',
-                                       batch_size=32, num_workers=4):
+                                       batch_size=32, num_workers=4,
+                                       split_policy='test_case', split_seed=42,
+                                       train_ratio=0.8):
     """
     Create data loaders for NPY format theta_cnn dataset
 
@@ -369,22 +489,28 @@ def create_theta_cnn_data_loaders_npy(dataset_root, train_problem='train_D', tes
     """
     from torch.utils.data import DataLoader
 
-    # Paths to NPY directories
-    train_path = os.path.join(dataset_root, 'train', 'raw', 'theta_cnn_npy', train_problem)
-    test_path = os.path.join(dataset_root, 'test', 'raw', 'theta_cnn_npy', test_problem)
-
-    # Check if NPY data exists
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(
-            f"NPY data not found at {train_path}\n"
-        )
+    layout, train_path, test_path = _resolve_npy_paths(
+        dataset_root, 'theta_cnn_npy', train_problem, test_problem
+    )
 
     print(f"Loading CNN NPY datasets from:")
     print(f"  Train: {train_path}")
     print(f"  Test: {test_path}")
 
-    train_dataset = CNNThetaDatasetNPY(train_path)
-    test_dataset = CNNThetaDatasetNPY(test_path)
+    if layout == "unsplit":
+        sample_files = sorted(glob.glob(os.path.join(train_path, "sample_*.npz")))
+        train_files, test_files, num_groups = _split_sample_files(
+            sample_files, "theta_cnn", split_policy, train_ratio, split_seed
+        )
+        print(
+            f"Created {split_policy} split from {num_groups} group(s), "
+            f"seed={split_seed}, train_ratio={train_ratio}"
+        )
+        train_dataset = CNNThetaDatasetNPY(train_path, sample_files=train_files)
+        test_dataset = CNNThetaDatasetNPY(test_path, sample_files=test_files)
+    else:
+        train_dataset = CNNThetaDatasetNPY(train_path)
+        test_dataset = CNNThetaDatasetNPY(test_path)
 
     train_loader = DataLoader(
         train_dataset,
@@ -404,7 +530,9 @@ def create_theta_cnn_data_loaders_npy(dataset_root, train_problem='train_D', tes
 
 
 def create_pvalue_data_loaders_npy(dataset_root, train_problem='train_D', test_problem='test_D',
-                                   batch_size=32, num_workers=4):
+                                   batch_size=32, num_workers=4,
+                                   split_policy='test_case', split_seed=42,
+                                   train_ratio=0.8):
     """
     Create data loaders for NPY format p_value dataset
 
@@ -413,22 +541,28 @@ def create_pvalue_data_loaders_npy(dataset_root, train_problem='train_D', test_p
     """
     from torch_geometric.loader import DataLoader
 
-    # Paths to NPY directories
-    train_path = os.path.join(dataset_root, 'train', 'raw', 'p_value_npy', train_problem)
-    test_path = os.path.join(dataset_root, 'test', 'raw', 'p_value_npy', test_problem)
-
-    # Check if NPY data exists
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(
-            f"NPY data not found at {train_path}\n"
-        )
+    layout, train_path, test_path = _resolve_npy_paths(
+        dataset_root, 'p_value_npy', train_problem, test_problem
+    )
 
     print(f"Loading NPY datasets from:")
     print(f"  Train: {train_path}")
     print(f"  Test: {test_path}")
 
-    train_dataset = PValueDatasetNPY(train_path)
-    test_dataset = PValueDatasetNPY(test_path)
+    if layout == "unsplit":
+        sample_files = sorted(glob.glob(os.path.join(train_path, "sample_*.npz")))
+        train_files, test_files, num_groups = _split_sample_files(
+            sample_files, "p_value", split_policy, train_ratio, split_seed
+        )
+        print(
+            f"Created {split_policy} split from {num_groups} group(s), "
+            f"seed={split_seed}, train_ratio={train_ratio}"
+        )
+        train_dataset = PValueDatasetNPY(train_path, sample_files=train_files)
+        test_dataset = PValueDatasetNPY(test_path, sample_files=test_files)
+    else:
+        train_dataset = PValueDatasetNPY(train_path)
+        test_dataset = PValueDatasetNPY(test_path)
 
     train_loader = DataLoader(
         train_dataset,
@@ -445,4 +579,3 @@ def create_pvalue_data_loaders_npy(dataset_root, train_problem='train_D', test_p
     )
 
     return train_loader, test_loader
-

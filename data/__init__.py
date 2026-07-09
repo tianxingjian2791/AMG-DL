@@ -33,8 +33,10 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from data_loader_npy import (
     GNNThetaDatasetNPY,
+    CNNThetaDatasetNPY,
     PValueDatasetNPY,
     create_theta_data_loaders_npy,
+    create_theta_cnn_data_loaders_npy,
     create_pvalue_data_loaders_npy
 )
 
@@ -51,8 +53,10 @@ __all__ = [
 
     # GNN data (NPY format - high performance)
     'GNNThetaDatasetNPY',
+    'CNNThetaDatasetNPY',
     'PValueDatasetNPY',
     'create_theta_data_loaders_npy',
+    'create_theta_cnn_data_loaders_npy',
     'create_pvalue_data_loaders_npy',
 
     # Unified data

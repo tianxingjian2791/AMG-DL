@@ -58,10 +58,21 @@ def parse_args():
     # Data configuration
     parser.add_argument('--dataset', type=str, required=True,
                       help='Test dataset directory')
+    parser.add_argument('--problem-type', type=str, default='auto',
+                      choices=['auto', 'D', 'E', 'S', 'GL', 'SC'],
+                      help='Problem type for dataset resolution')
+    parser.add_argument('--diffusion-scale', type=str, default='small',
+                      choices=['small', 'large', 'paper'],
+                      help='Diffusion scale folder to use when problem-type is D')
     parser.add_argument('--test-file', type=str, default='test_D.csv',
                       help='Test CSV filename (or problem type for NPY)')
     parser.add_argument('--use-npy', action='store_true',
                       help='Use NPY/NPZ format instead of CSV (5× faster)')
+    parser.add_argument('--split-policy', type=str, default='test_case',
+                      choices=['test_case', 'sample', 'h', 'epsilon'],
+                      help='Split policy for unsplit NPZ datasets')
+    parser.add_argument('--train-ratio', type=float, default=0.8,
+                      help='Training ratio for unsplit NPZ datasets')
     parser.add_argument('--batch-size', type=int, default=32,
                       help='Batch size for evaluation')
 
@@ -92,6 +103,24 @@ def parse_args():
                       help='Save individual predictions to file')
 
     return parser.parse_args()
+
+
+def resolve_dataset_root(base_dataset, problem_type, diffusion_scale):
+    """Resolve the on-disk dataset root, including scale-specific diffusion folders."""
+    if problem_type != 'D':
+        return base_dataset
+
+    diffusion_root = os.path.join(base_dataset, 'diffusion', diffusion_scale)
+    return diffusion_root if os.path.exists(diffusion_root) else base_dataset
+
+
+def infer_problem_type(file_name, requested_problem_type):
+    if requested_problem_type != 'auto':
+        return requested_problem_type
+
+    if '_d' in file_name.lower():
+        return 'D'
+    return 'auto'
 
 
 def load_model(args, device):
@@ -486,8 +515,20 @@ def main():
     print(f"Model: {args.model}")
     print(f"Type: {args.model_type}")
     print(f"Dataset: {args.dataset}")
+    print(f"Problem type: {args.problem_type}")
+    if args.problem_type == 'D':
+        print(f"Diffusion scale: {args.diffusion_scale}")
     print(f"Format: {'NPY/NPZ' if args.use_npy else 'CSV'}")
     print("="*60)
+
+    resolved_problem_type = infer_problem_type(args.test_file, args.problem_type)
+    dataset_root = resolve_dataset_root(args.dataset, resolved_problem_type, args.diffusion_scale)
+    if dataset_root != args.dataset:
+        print(f"Resolved dataset root: {dataset_root}")
+        args.dataset = dataset_root
+    if resolved_problem_type != args.problem_type:
+        print(f"Resolved problem type: {resolved_problem_type}")
+        args.problem_type = resolved_problem_type
 
     # Get device
     device = get_device()
@@ -509,7 +550,10 @@ def main():
                 train_problem='train_D',  # Not used, but required
                 test_problem=test_problem,
                 batch_size=args.batch_size,
-                num_workers=args.num_workers
+                num_workers=args.num_workers,
+                split_policy=args.split_policy,
+                split_seed=args.seed,
+                train_ratio=args.train_ratio
             )
         else:
             from data import create_p_value_data_loaders
@@ -541,7 +585,10 @@ def main():
                     train_problem='train_D',  # Not used, but required
                     test_problem=test_problem,
                     batch_size=args.batch_size,
-                    num_workers=args.num_workers
+                    num_workers=args.num_workers,
+                    split_policy=args.split_policy,
+                    split_seed=args.seed,
+                    train_ratio=args.train_ratio
                 )
             else:
                 # GNN model uses standard NPY data loader
@@ -553,7 +600,10 @@ def main():
                     train_problem='train_D',  # Not used, but required
                     test_problem=test_problem,
                     batch_size=args.batch_size,
-                    num_workers=args.num_workers
+                    num_workers=args.num_workers,
+                    split_policy=args.split_policy,
+                    split_seed=args.seed,
+                    train_ratio=args.train_ratio
                 )
         else:
             _, test_loader = create_theta_data_loaders(
@@ -580,7 +630,10 @@ def main():
                 train_problem='train_D',
                 test_problem=test_problem,
                 batch_size=args.batch_size,
-                num_workers=args.num_workers
+                num_workers=args.num_workers,
+                split_policy=args.split_policy,
+                split_seed=args.seed,
+                train_ratio=args.train_ratio
             )
         else:
             _, test_loader = create_theta_data_loaders(

@@ -37,6 +37,8 @@
 #include <fstream>
 #include <iostream>
 #include <cmath>
+#include <array>
+#include <chrono>
 
 #include "AMGOperators.hpp"
 
@@ -45,13 +47,44 @@ namespace AMGDiffusion
 {
   using namespace dealii;
 
-  // Simplified exact solution (uniform cosine form)
+  // Paper-aligned coefficient patterns:
+  // (a) left/right split
+  // (b) 2x2 checkerboard
+  // (c) four vertical stripes
+  // (d) 4x4 checkerboard
+  enum class DiffusionPattern
+  {
+    VERTICAL_STRIPES,
+    CHECKERBOARD_2X2,
+    VERTICAL_STRIPES_4,
+    CHECKERBOARD_4X4
+  };
+
+  inline const char *pattern_to_string(DiffusionPattern pattern)
+  {
+    switch (pattern)
+    {
+    case DiffusionPattern::VERTICAL_STRIPES:
+      return "vertical_stripes";
+    case DiffusionPattern::CHECKERBOARD_2X2:
+      return "checkerboard_2x2";
+    case DiffusionPattern::VERTICAL_STRIPES_4:
+      return "vertical_stripes_4";
+    case DiffusionPattern::CHECKERBOARD_4X4:
+      return "checkerboard_4x4";
+    default:
+      return "unknown";
+    }
+  }
+
+  // Manufactured solution matched to the paper's pattern families.
   template <int dim>
   class ExactSolution : public Function<dim>
   {
   public:
-    ExactSolution()
+    ExactSolution(DiffusionPattern pattern)
       : Function<dim>(1)
+      , pattern(pattern)
     {}
 
     virtual double value(const Point<dim> &p, const unsigned int component = 0) const override
@@ -59,17 +92,32 @@ namespace AMGDiffusion
       (void)component;
       const double x = p[0];
       const double y = p[1];
-      return std::cos(M_PI * x) * std::cos(M_PI * y);
+      switch (pattern)
+      {
+      case DiffusionPattern::VERTICAL_STRIPES:
+      case DiffusionPattern::CHECKERBOARD_2X2:
+        return std::cos(M_PI * x) * std::cos(M_PI * y);
+      case DiffusionPattern::VERTICAL_STRIPES_4:
+      case DiffusionPattern::CHECKERBOARD_4X4:
+        return std::cos(2 * M_PI * x) * std::cos(2 * M_PI * y);
+      default:
+        AssertThrow(false, ExcNotImplemented());
+        return 0.0;
+      }
     }
+
+  private:
+    DiffusionPattern pattern;
   };
 
-  // Simplified right-hand side function
+  // Right-hand side corresponding to the chosen manufactured solution.
   template <int dim>
   class RightHandSide : public Function<dim>
   {
   public:
-    RightHandSide()
+    RightHandSide(DiffusionPattern pattern)
       : Function<dim>(1)
+      , pattern(pattern)
     {}
 
     virtual double value(const Point<dim> &p, const unsigned int component = 0) const override
@@ -77,29 +125,80 @@ namespace AMGDiffusion
       (void)component;
       const double x = p[0];
       const double y = p[1];
-      const double u_value = std::cos(M_PI * x) * std::cos(M_PI * y);
-      return 2 * M_PI * M_PI * u_value; // -Δu = 2π²u
+      switch (pattern)
+      {
+      case DiffusionPattern::VERTICAL_STRIPES:
+      case DiffusionPattern::CHECKERBOARD_2X2:
+      {
+        const double u_value = std::cos(M_PI * x) * std::cos(M_PI * y);
+        return 2 * M_PI * M_PI * u_value; // -Δu = 2π²u
+      }
+      case DiffusionPattern::VERTICAL_STRIPES_4:
+      case DiffusionPattern::CHECKERBOARD_4X4:
+      {
+        const double u_value = std::cos(2 * M_PI * x) * std::cos(2 * M_PI * y);
+        return 8 * M_PI * M_PI * u_value; // -Δu = 8π²u
+      }
+      default:
+        AssertThrow(false, ExcNotImplemented());
+        return 0.0;
+      }
     }
+
+  private:
+    DiffusionPattern pattern;
   };
 
-  // Simplified uniform diffusion coefficient
+  // Piecewise-constant diffusion coefficient aligned with the mesh.
   template <int dim>
   class DiffusionCoefficient : public Function<dim>
   {
   public:
-    DiffusionCoefficient(double epsilon)
-      : Function<dim>(1), epsilon(epsilon)
+    DiffusionCoefficient(DiffusionPattern pattern, double epsilon)
+      : Function<dim>(1)
+      , pattern(pattern)
+      , epsilon(epsilon)
     {}
 
     virtual double value(const Point<dim> &p, const unsigned int component = 0) const override
     {
       (void)component;
-      (void)p;
-      // Uniform diffusion coefficient everywhere
-      return std::pow(10.0, epsilon);
+      const double x = p[0];
+      const double y = p[1];
+      const double high = std::pow(10.0, epsilon);
+      const double tol = 1e-12;
+
+      switch (pattern)
+      {
+      case DiffusionPattern::VERTICAL_STRIPES:
+        return (x < 0.0 + tol) ? 1.0 : high;
+      case DiffusionPattern::CHECKERBOARD_2X2:
+      {
+        const int i = std::min(static_cast<int>(std::floor(x + 1.0)), 1);
+        const int j = std::min(static_cast<int>(std::floor(y + 1.0)), 1);
+        return ((i + j) % 2 == 0) ? 1.0 : high;
+      }
+      case DiffusionPattern::VERTICAL_STRIPES_4:
+        if (x < -0.5 + tol) return 1.0;
+        if (x < 0.0 + tol) return high;
+        if (x < 0.5 + tol) return 1.0;
+        return high;
+      case DiffusionPattern::CHECKERBOARD_4X4:
+      {
+        int i = static_cast<int>(std::floor((x + 1.0) / 0.5));
+        int j = static_cast<int>(std::floor((y + 1.0) / 0.5));
+        i = std::min(i, 3);
+        j = std::min(j, 3);
+        return ((i + j) % 2 == 0) ? 1.0 : high;
+      }
+      default:
+        AssertThrow(false, ExcNotImplemented());
+        return 0.0;
+      }
     }
 
   private:
+    DiffusionPattern pattern;
     double epsilon;
   };
 
@@ -116,7 +215,9 @@ namespace AMGDiffusion
   class Solver
   {
   public:
+    Solver(DiffusionPattern pattern, double epsilon, unsigned int refinement);
     Solver(double epsilon, unsigned int refinement);
+    void set_pattern(DiffusionPattern pattern);
     void set_theta(double theta);
     void set_epsilon(double epsilon);
     void set_refinement(unsigned int refinement);
@@ -128,6 +229,9 @@ namespace AMGDiffusion
     AMGOperators::CSRMatrix get_system_matrix_csr();
     double get_mesh_size() const;
     double get_convergence_factor() const;
+    double get_linear_solve_elapsed_sec() const;
+    unsigned int get_solver_iterations() const;
+    unsigned int get_amg_hierarchy_levels() const;
 
     // support static function
     static std::vector<double> linspace(double start, double end, size_t num_points)
@@ -155,9 +259,12 @@ namespace AMGDiffusion
     void write_matrix_to_csv(const PETScWrappers::MPI::SparseMatrix &matrix, std::ofstream &file, double rho, double h);
     void write_pvalue_to_csv(const PETScWrappers::MPI::SparseMatrix &matrix, std::ofstream &file, double rho, double h);
     AMGOperators::CSRMatrix petsc_to_csr(const PETScWrappers::MPI::SparseMatrix &matrix);
+    void update_amg_hierarchy_levels(
+      const dealii::PETScWrappers::PreconditionBoomerAMG &preconditioner);
 
 
     // mode parameter
+    DiffusionPattern pattern;
     double theta;
     double epsilon;
     unsigned int refinement;
@@ -165,7 +272,10 @@ namespace AMGDiffusion
 
     // Convergence metrics (to be stored after solve)
     double convergence_factor;
+    double linear_solve_elapsed_sec;
     double mesh_size_h;
+    unsigned int solver_iterations;
+    unsigned int amg_hierarchy_levels;
 
     // Grids and finite elements
     dealii::Triangulation<dim> triangulation;
@@ -187,18 +297,26 @@ namespace AMGDiffusion
   };
 
   template <int dim>
-  Solver<dim>::Solver(double epsilon, unsigned int refinement)
-    : epsilon(epsilon)
+  Solver<dim>::Solver(DiffusionPattern pattern, double epsilon, unsigned int refinement)
+    : pattern(pattern)
+    , epsilon(epsilon)
     , refinement(refinement)
+    , output_format(OutputFormat::THETA_GNN) // default format
+    , convergence_factor(1.0)
+    , mesh_size_h(0.0)
+    , solver_iterations(0)
+    , amg_hierarchy_levels(0)
     , fe(1) // Q1 FE
     , dof_handler(triangulation)
     , solver_control(1000, 1e-12) // max iterations is 1000，tolerance is 1e-12
-    , convergence_factor(1.0)
-    , mesh_size_h(0.0)
-    , exact_solution()
-    , right_hand_side()
-    , diffusion_coefficient(epsilon)
-    , output_format(OutputFormat::THETA_GNN) // default format
+    , exact_solution(pattern)
+    , right_hand_side(pattern)
+    , diffusion_coefficient(pattern, epsilon)
+  {}
+
+  template <int dim>
+  Solver<dim>::Solver(double epsilon, unsigned int refinement)
+    : Solver(DiffusionPattern::VERTICAL_STRIPES, epsilon, refinement)
   {}
 
   template <int dim>
@@ -208,8 +326,8 @@ namespace AMGDiffusion
     GridGenerator::hyper_cube(triangulation, -1.0, 1.0);
     triangulation.refine_global(refinement);
 
-    // Compute mesh size (diameter of largest cell)
-    mesh_size_h = GridTools::maximal_cell_diameter(triangulation);
+    // Store the cell side length used as h in the paper tables.
+    mesh_size_h = GridTools::maximal_cell_diameter(triangulation) / std::sqrt(dim);
     // std::cout << "Number of active cells: " << triangulation.n_active_cells() << std::endl;
   }
 
@@ -218,6 +336,15 @@ namespace AMGDiffusion
   {
     this->theta = theta;
     // std::cout<<this->theta<<std::endl;
+  }
+
+  template <int dim>
+  void Solver<dim>::set_pattern(DiffusionPattern pattern)
+  {
+    this->pattern = pattern;
+    exact_solution = ExactSolution<dim>(pattern);
+    right_hand_side = RightHandSide<dim>(pattern);
+    diffusion_coefficient = DiffusionCoefficient<dim>(pattern, epsilon);
   }
 
   template <int dim>
@@ -349,6 +476,7 @@ namespace AMGDiffusion
 
     // Initialize the preconditioner of AMG
     preconditioner.initialize(system_matrix, data);
+    preconditioner.setup();
 
     PETScWrappers::MPI::Vector residual(system_rhs);
 
@@ -357,20 +485,25 @@ namespace AMGDiffusion
     double init_r_norm = residual.l2_norm();
     // std::cout<<init_r_norm<<" ";
 
-    // Solve the system
+    // Time only the preconditioned CG solve, excluding grid/setup/assembly and reporting.
+    const auto linear_solve_start = std::chrono::steady_clock::now();
     solver.solve(system_matrix, solution, system_rhs, preconditioner);
+    const auto linear_solve_end = std::chrono::steady_clock::now();
+    linear_solve_elapsed_sec = std::chrono::duration<double>(linear_solve_end - linear_solve_start).count();
 
     system_matrix.vmult(residual, solution);
     residual -= system_rhs;
     double final_r_norm = residual.l2_norm();  
     // std::cout<<final_r_norm<<std::endl;
 
+    update_amg_hierarchy_levels(preconditioner);
 
     // Print the iterative information
     // std::cout << "   Solver converged in " << solver_control.last_step()
     //           << " iterations." << std::endl;
 
     const unsigned int k = solver_control.last_step();
+    solver_iterations = k;
     if (k < 1) {
       std::cerr << "Warning: Insufficient residuals recorded (" 
                 << k << "). Returning rho=0." << std::endl;
@@ -379,7 +512,7 @@ namespace AMGDiffusion
 
     // ρ = (||r_k|| / ||r_0||)^{1/k}
     const double rho = (k > 0) ? std::pow(final_r_norm / init_r_norm, 1.0 / k) : 0.0;
-    double h = triangulation.begin_active()->diameter(); // The size of grids
+    double h = mesh_size_h; // Cell side length, matching the paper's h values.
 
     // Store for getter methods
     convergence_factor = rho;
@@ -578,6 +711,7 @@ namespace AMGDiffusion
     data.symmetric_operator = true;
 
     preconditioner.initialize(system_matrix, data);
+    preconditioner.setup();
 
     PETScWrappers::MPI::Vector residual(system_rhs);
 
@@ -585,13 +719,19 @@ namespace AMGDiffusion
     residual -= system_rhs;
     double init_r_norm = residual.l2_norm();
 
+    const auto linear_solve_start = std::chrono::steady_clock::now();
     solver.solve(system_matrix, solution, system_rhs, preconditioner);
+    const auto linear_solve_end = std::chrono::steady_clock::now();
+    linear_solve_elapsed_sec = std::chrono::duration<double>(linear_solve_end - linear_solve_start).count();
 
     system_matrix.vmult(residual, solution);
     residual -= system_rhs;
     double final_r_norm = residual.l2_norm();
 
+    update_amg_hierarchy_levels(preconditioner);
+
     const unsigned int k = solver_control.last_step();
+    solver_iterations = k;
     if (k < 1)
     {
       std::cerr << "Warning: Insufficient residuals recorded ("
@@ -600,7 +740,8 @@ namespace AMGDiffusion
     }
 
     const double rho = (k > 0) ? std::pow(final_r_norm / init_r_norm, 1.0 / k) : 0.0;
-    double h = triangulation.begin_active()->diameter();
+    double h = mesh_size_h;
+    convergence_factor = rho;
 
     // Write based on format
     if (format == OutputFormat::P_VALUE)
@@ -619,6 +760,11 @@ namespace AMGDiffusion
   template <int dim>
   void Solver<dim>::run(std::ofstream &file)
   {
+    amg_hierarchy_levels = 0;
+    solver_iterations = 0;
+    convergence_factor = 1.0;
+    linear_solve_elapsed_sec = 0.0;
+
     make_grid();
     setup_system();
     assemble_system();
@@ -629,6 +775,11 @@ namespace AMGDiffusion
   template <int dim>
   void Solver<dim>::run(std::ofstream &file, OutputFormat format)
   {
+    amg_hierarchy_levels = 0;
+    solver_iterations = 0;
+    convergence_factor = 1.0;
+    linear_solve_elapsed_sec = 0.0;
+
     make_grid();
     setup_system();
     assemble_system();
@@ -656,12 +807,48 @@ namespace AMGDiffusion
     return convergence_factor;
   }
 
+  template <int dim>
+  double Solver<dim>::get_linear_solve_elapsed_sec() const
+  {
+    return linear_solve_elapsed_sec;
+  }
+
+  template <int dim>
+  unsigned int Solver<dim>::get_solver_iterations() const
+  {
+    return solver_iterations;
+  }
+
+  template <int dim>
+  unsigned int Solver<dim>::get_amg_hierarchy_levels() const
+  {
+    return amg_hierarchy_levels;
+  }
+
+  template <int dim>
+  void Solver<dim>::update_amg_hierarchy_levels(
+    const dealii::PETScWrappers::PreconditionBoomerAMG &preconditioner)
+  {
+    PetscInt num_levels = 0;
+    Mat *coarse_operators = nullptr;
+    const PetscErrorCode ierr = PCGetCoarseOperators(preconditioner.get_pc(),
+                                                     &num_levels,
+                                                     &coarse_operators);
+    if (ierr != 0)
+      throw std::runtime_error("Failed to read BoomerAMG hierarchy levels from PETSc.");
+    amg_hierarchy_levels = static_cast<unsigned int>(num_levels);
+
+    for (PetscInt level = 0; level < num_levels - 1; ++level)
+      MatDestroy(&coarse_operators[level]);
+    PetscFree(coarse_operators);
+  }
+
   
   // Generate complete dataset (LEGACY - deprecated, will be removed)
   void generate_dataset(std::ofstream &file, std::string train_flag)
   {
     std::cerr << "ERROR: generate_dataset() is deprecated." << std::endl;
-    std::cerr << "This function used DiffusionPattern which has been removed." << std::endl;
+    std::cerr << "This legacy dataset path has been replaced by the unified generator." << std::endl;
     std::cerr << "Please use the unified generator: ./generate_amg_data" << std::endl;
     throw std::runtime_error("Deprecated function called");
   }
