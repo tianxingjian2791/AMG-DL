@@ -35,7 +35,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 # Import models
-from model import create_unified_model, GNNModel, CNNModel, EncodeProcessDecode
+from model import GNNModel, CNNModel, EncodeProcessDecode
 
 # Import data
 from data import create_theta_data_loaders
@@ -69,10 +69,10 @@ def parse_args():
     parser.add_argument('--use-npy', action='store_true',
                       help='Use NPY/NPZ format instead of CSV (5× faster)')
     parser.add_argument('--split-policy', type=str, default='test_case',
-                      choices=['test_case', 'sample', 'h', 'epsilon'],
-                      help='Split policy for unsplit NPZ datasets')
+                      choices=['test_case', 'sample', 'h', 'epsilon', 'h_theta'],
+                      help='Split policy for unsplit NPZ datasets (CSV CNN loader only supports sample/h_theta)')
     parser.add_argument('--train-ratio', type=float, default=0.8,
-                      help='Training ratio for unsplit NPZ datasets')
+                      help='Training ratio for unsplit NPZ/CSV datasets')
     parser.add_argument('--batch-size', type=int, default=32,
                       help='Batch size for evaluation')
 
@@ -128,13 +128,11 @@ def load_model(args, device):
     print(f"\nLoading model from: {args.model}")
 
     if args.model_type == 'unified':
-        # Load unified model
-        checkpoint = torch.load(args.model, map_location=device)
-        model = create_unified_model(
-            stage1_type='GNN',  # Adjust based on checkpoint
-            device=device
+        raise NotImplementedError(
+            "--model-type unified is not implemented: there is no unified two-stage "
+            "model builder in model/ (create_unified_model doesn't exist). Evaluate "
+            "stage1_cnn, stage1_gnn, or stage2 individually instead."
         )
-        model.load_state_dict(checkpoint)
 
     elif args.model_type == 'stage1_gnn':
         # Load GNN theta predictor
@@ -604,6 +602,51 @@ def main():
                     split_policy=args.split_policy,
                     split_seed=args.seed,
                     train_ratio=args.train_ratio
+                )
+        elif args.model_type == 'stage1_cnn':
+            # CNN model: pooled-matrix theta_cnn CSV, not the GNN sparse-matrix CSV format
+            test_path = os.path.join(args.dataset, 'test', 'raw', 'theta_cnn', args.test_file)
+
+            if os.path.exists(test_path):
+                # Pre-split legacy layout
+                from data.cnn_data_processing import CSVDataset
+                from torch.utils.data import DataLoader
+
+                test_dataset = CSVDataset(test_path)
+                test_loader = DataLoader(
+                    test_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=args.num_workers
+                )
+            else:
+                # Unsplit single CSV: reproduce the same split used at training time
+                # (same seed/ratio/policy) and evaluate on the held-out test rows only.
+                unsplit_path = os.path.join(args.dataset, 'theta_cnn', args.test_file)
+                if not os.path.exists(unsplit_path):
+                    unsplit_path = os.path.join(args.dataset, args.test_file)
+                if not os.path.exists(unsplit_path):
+                    raise FileNotFoundError(
+                        "Could not find a pre-split test CSV or an unsplit theta_cnn CSV. "
+                        f"Checked:\n  {test_path}\n  {unsplit_path}"
+                    )
+
+                split_policy = args.split_policy if args.split_policy in ('sample', 'h_theta') else 'sample'
+                if args.split_policy not in ('sample', 'h_theta'):
+                    print(
+                        f"Warning: split-policy '{args.split_policy}' is not supported for the "
+                        f"unsplit CSV CNN loader, falling back to 'sample'."
+                    )
+
+                from data.cnn_data_processing import create_theta_cnn_dataloaders_from_csv
+
+                _, test_loader = create_theta_cnn_dataloaders_from_csv(
+                    unsplit_path,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    train_ratio=args.train_ratio,
+                    seed=args.seed,
+                    split_policy=split_policy
                 )
         else:
             _, test_loader = create_theta_data_loaders(

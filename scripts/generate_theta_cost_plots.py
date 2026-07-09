@@ -20,7 +20,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from utils.data import SampleRecordRepository
 
 
-DEFAULT_INPUT_GLOB = "datasets/diffusion/large/**/raw/diffusion_reports/*.csv"
+DEFAULT_INPUT_GLOB = "datasets/diffusion/large/**/diffusion_reports/*.csv"
 DEFAULT_PATTERNS = ("vertical_stripes_4", "checkerboard_4x4")
 DEFAULT_EPSILONS = (0.0, 0.4, 0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.5, 5.0, 7.0, 9.5)
 DEFAULT_H_VALUES = (0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625, 0.001953125, 0.0009765625)
@@ -55,13 +55,13 @@ class CostStats:
 
 
 def _parse_csv_floats(raw: str, default: tuple[float, ...]) -> tuple[float, ...]:
-    if not raw:
+    if not raw or raw.strip().lower() == "auto":
         return default
     return tuple(float(value.strip()) for value in raw.split(",") if value.strip())
 
 
 def _parse_csv_text(raw: str, default: tuple[str, ...]) -> tuple[str, ...]:
-    if not raw:
+    if not raw or raw.strip().lower() == "auto":
         return default
     return tuple(value.strip() for value in raw.split(",") if value.strip())
 
@@ -127,6 +127,28 @@ def _available_thetas(
         if pat == pattern and epsilon in eps_set and h in h_set
     }
     return tuple(sorted(values))
+
+
+def _available_patterns(stats: dict[tuple[str, float, float, float], CostStats]) -> tuple[str, ...]:
+    return tuple(sorted({pattern for pattern, _, _, _ in stats}))
+
+
+def _available_epsilons(
+    stats: dict[tuple[str, float, float, float], CostStats],
+    patterns: tuple[str, ...],
+) -> tuple[float, ...]:
+    pattern_set = set(patterns)
+    return tuple(sorted({epsilon for pattern, epsilon, _, _ in stats if pattern in pattern_set}))
+
+
+def _available_h_values(
+    stats: dict[tuple[str, float, float, float], CostStats],
+    patterns: tuple[str, ...],
+    epsilons: tuple[float, ...],
+) -> tuple[float, ...]:
+    pattern_set = set(patterns)
+    epsilon_set = {round(value, 8) for value in epsilons}
+    return tuple(sorted({h for pattern, epsilon, h, _ in stats if pattern in pattern_set and epsilon in epsilon_set}, reverse=True))
 
 
 def _coverage(
@@ -244,6 +266,8 @@ def _figure_tex(
     thetas: tuple[float, ...],
 ) -> str:
     title = PATTERN_TITLES.get(pattern, pattern.replace("_", " "))
+    columns = 2 if len(h_values) > 1 else 1
+    rows = max(1, math.ceil(len(h_values) / columns))
     axes = [
         _axis_block(stats, pattern, h, epsilons, thetas, legend=(index == len(h_values) - 1))
         for index, h in enumerate(h_values)
@@ -254,9 +278,9 @@ def _figure_tex(
             "\\begin{center}",
             "\\begin{tikzpicture}",
             "\\begin{groupplot}[",
-            "group style={group size=2 by 4, horizontal sep=1.4cm, vertical sep=1.2cm},",
+            f"group style={{group size={columns} by {rows}, horizontal sep=1.4cm, vertical sep=1.2cm}},",
             "width=0.44\\textwidth,",
-            "height=0.245\\textheight,",
+            f"height={0.98 / rows:.3f}\\textheight,",
             "]",
             *axes,
             "\\end{groupplot}",
@@ -300,12 +324,14 @@ def _write_svg(
     thetas: tuple[float, ...],
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    columns = 2 if len(h_values) > 1 else 1
+    rows = max(1, math.ceil(len(h_values) / columns))
     width = 900
-    height = 1180
+    height = 40 + rows * 275
     panel_w = 360
     panel_h = 230
-    lefts = (70, 500)
-    tops = (40, 315, 590, 865)
+    lefts = (70, 500) if columns == 2 else (270,)
+    tops = tuple(40 + row * 275 for row in range(rows))
     plot_pad_l = 48
     plot_pad_r = 16
     plot_pad_t = 28
@@ -444,7 +470,9 @@ def _write_png(
         }
     )
 
-    fig, axes = plt.subplots(4, 2, figsize=(6.2, 8.7), dpi=dpi)
+    columns = 2 if len(h_values) > 1 else 1
+    rows = max(1, math.ceil(len(h_values) / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(6.2, 2.175 * rows), dpi=dpi, squeeze=False)
     fig.subplots_adjust(left=0.105, right=0.985, top=0.985, bottom=0.075, hspace=0.58, wspace=0.38)
 
     x_min, x_max = 0.0, 0.92
@@ -520,6 +548,9 @@ def _write_png(
             )
             legend.get_frame().set_linewidth(0.45)
 
+    for ax in axes_flat[len(h_values) :]:
+        ax.set_visible(False)
+
     fig.savefig(destination, bbox_inches="tight", pad_inches=0.025)
     plt.close(fig)
 
@@ -549,9 +580,9 @@ def main() -> None:
     )
     parser.add_argument("--input-glob", default=DEFAULT_INPUT_GLOB)
     parser.add_argument("--out-dir", default="results/figures/theta_cost_relation")
-    parser.add_argument("--patterns", default=",".join(DEFAULT_PATTERNS))
-    parser.add_argument("--epsilons", default=",".join(str(value) for value in DEFAULT_EPSILONS))
-    parser.add_argument("--h-values", default=",".join(str(value) for value in DEFAULT_H_VALUES))
+    parser.add_argument("--patterns", default="auto")
+    parser.add_argument("--epsilons", default="auto")
+    parser.add_argument("--h-values", default="auto")
     parser.add_argument("--thetas", default="", help="Optional comma-separated theta grid. Defaults to values found in input.")
     parser.add_argument("--tex-name", default="theta_cost_plots.tex")
     parser.add_argument("--svg", action="store_true", help="Also write one scalable SVG per pattern.")
@@ -563,12 +594,18 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    patterns = _parse_csv_text(args.patterns, DEFAULT_PATTERNS)
-    epsilons = _parse_csv_floats(args.epsilons, DEFAULT_EPSILONS)
-    h_values = _parse_csv_floats(args.h_values, DEFAULT_H_VALUES)
     stats, matches = _load_cost_stats(args.input_glob)
 
     print(f"Loaded {len(stats)} grouped cost records from {len(matches)} file(s).")
+
+    auto_patterns = _available_patterns(stats)
+    patterns = _parse_csv_text(args.patterns, auto_patterns or DEFAULT_PATTERNS)
+    epsilons = _parse_csv_floats(args.epsilons, _available_epsilons(stats, patterns) or DEFAULT_EPSILONS)
+    h_values = _parse_csv_floats(args.h_values, _available_h_values(stats, patterns, epsilons) or DEFAULT_H_VALUES)
+    print(
+        "Using "
+        f"{len(patterns)} pattern(s), {len(epsilons)} epsilon value(s), and {len(h_values)} h value(s)."
+    )
 
     figures = []
     for pattern in patterns:
@@ -595,12 +632,48 @@ def main() -> None:
             print(f"Wrote {svg_path}")
         if args.png:
             png_path = out_dir / f"{pattern}_theta_cost.png"
-            _write_png(png_path, stats, pattern, epsilons, h_values, thetas, scale=max(1, args.png_scale))
-            print(f"Wrote {png_path}")
+            try:
+                _write_png(png_path, stats, pattern, epsilons, h_values, thetas, scale=max(1, args.png_scale))
+            except RuntimeError as exc:
+                print(f"WARNING: could not write {png_path}: {exc}")
+                svg_path = out_dir / f"{pattern}_theta_cost.svg"
+                _write_svg(svg_path, stats, pattern, epsilons, h_values, thetas)
+                print(f"Wrote {svg_path}")
+            else:
+                print(f"Wrote {png_path}")
         figures.append(_figure_tex(stats, pattern, epsilons, h_values, thetas))
 
     if not figures:
-        raise ValueError("No figures were generated. Check --input-glob and --patterns.")
+        fallback_patterns = _available_patterns(stats)
+        if args.strict or tuple(patterns) == fallback_patterns:
+            raise ValueError("No figures were generated. Check --input-glob and --patterns.")
+        print("WARNING: requested patterns produced no figures; retrying with all available patterns.")
+        patterns = fallback_patterns
+        epsilons = _available_epsilons(stats, patterns) or epsilons
+        h_values = _available_h_values(stats, patterns, epsilons) or h_values
+        for pattern in patterns:
+            thetas = _parse_csv_floats(args.thetas, ()) if args.thetas else _available_thetas(stats, pattern, epsilons, h_values)
+            if not thetas:
+                continue
+            _write_summary_csv(out_dir / f"{pattern}_theta_cost_summary.csv", stats, pattern, epsilons, h_values, thetas)
+            if args.svg:
+                svg_path = out_dir / f"{pattern}_theta_cost.svg"
+                _write_svg(svg_path, stats, pattern, epsilons, h_values, thetas)
+                print(f"Wrote {svg_path}")
+            if args.png:
+                png_path = out_dir / f"{pattern}_theta_cost.png"
+                try:
+                    _write_png(png_path, stats, pattern, epsilons, h_values, thetas, scale=max(1, args.png_scale))
+                except RuntimeError as exc:
+                    print(f"WARNING: could not write {png_path}: {exc}")
+                    svg_path = out_dir / f"{pattern}_theta_cost.svg"
+                    _write_svg(svg_path, stats, pattern, epsilons, h_values, thetas)
+                    print(f"Wrote {svg_path}")
+                else:
+                    print(f"Wrote {png_path}")
+            figures.append(_figure_tex(stats, pattern, epsilons, h_values, thetas))
+        if not figures:
+            raise ValueError("No figures were generated from the available records.")
 
     tex_path = out_dir / args.tex_name
     tex_path.write_text(_document_tex(figures), encoding="utf-8")

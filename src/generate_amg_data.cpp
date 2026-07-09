@@ -71,6 +71,12 @@ enum class DatasetScale {
     PAPER = 2,
 };
 
+// Mesh cell type for FEM problems (currently only honored by Diffusion).
+enum class CellType {
+    QUAD,
+    SIMPLEX
+};
+
 struct CommandLineArgs {
     ProblemType problem;
     DatasetSplit split = DatasetSplit::ALL;
@@ -81,6 +87,7 @@ struct CommandLineArgs {
     int seed = 42;
     bool verbose = false;
     bool use_npy = false;  // Use CSV as default, can switch to NPZ for better performance
+    CellType cell_type = CellType::QUAD;  // Diffusion-only: quad (default) or simplex
 };
 
 
@@ -168,6 +175,14 @@ std::string split_to_string(DatasetSplit split) {
         case DatasetSplit::TRAIN: return "train";
         case DatasetSplit::TEST: return "test";
         case DatasetSplit::ALL: return "all";
+        default: return "unknown";
+    }
+}
+
+std::string cell_type_to_string(CellType cell_type) {
+    switch (cell_type) {
+        case CellType::QUAD: return "quad";
+        case CellType::SIMPLEX: return "simplex";
         default: return "unknown";
     }
 }
@@ -306,7 +321,7 @@ class UnifiedAMGDataGenerator {
 public:
     explicit UnifiedAMGDataGenerator(const CommandLineArgs& args)
         : args_(args) {
-        output_base_ = args_.output_dir + "/" + split_to_string(args_.split) + "/raw/";
+        output_base_ = args_.output_dir + "/" + split_to_string(args_.split) + "/";
     }
 
     void generate() {
@@ -860,7 +875,11 @@ void UnifiedAMGDataGenerator::generate_diffusion() {
         AMGDiffusion::DiffusionPattern::CHECKERBOARD_4X4
     };
     const std::string diffusion_scale = scale_to_string(args_.scale);
-    const std::string diffusion_base = args_.output_dir + "/diffusion/" + diffusion_scale + "/raw/";
+    const bool use_simplex = (args_.cell_type == CellType::SIMPLEX);
+    // Empty for QUAD keeps output paths byte-identical to pre-existing runs;
+    // SIMPLEX gets its own non-colliding subtree.
+    const std::string cell_type_segment = use_simplex ? "simplex/" : "";
+    const std::string diffusion_base = args_.output_dir + "/diffusion/" + diffusion_scale + "/" + cell_type_segment;
     const std::vector<double> param1_values_vec = config.param1_values;
 
     int total = static_cast<int>(param1_values_vec.size() * config.refinements.size() * config.theta_values.size() * patterns.size());
@@ -943,7 +962,7 @@ void UnifiedAMGDataGenerator::generate_diffusion() {
         for (double epsilon : param1_values_vec) {
             for (unsigned int refinement : config.refinements) {
                 for (double theta : config.theta_values) {
-                    AMGDiffusion::Solver<2> solver(pattern, epsilon, refinement);
+                    AMGDiffusion::Solver<2> solver(pattern, epsilon, refinement, use_simplex);
                     solver.set_theta(theta);
 
                     // Solve (this stores convergence metrics internally)
@@ -1450,6 +1469,7 @@ void print_help() {
     std::cout << "  --seed SEED               Random seed (default: 42)\n";
     std::cout << "  -v, --verbose             Verbose progress output\n";
     std::cout << "  --use-npy                 Use NPZ (binary) format instead of CSV (text)\n";
+    std::cout << "  -e, --cell-type TYPE      Mesh cell type, Diffusion only: quad|simplex (default: quad)\n";
     std::cout << "  -h, --help                Show this help message\n\n";
 
     std::cout << "Problem Types:\n";
@@ -1573,6 +1593,20 @@ bool parse_arguments(int argc, char* argv[], CommandLineArgs& args) {
         else if (arg == "--use-npy") {
             args.use_npy = true;
         }
+        else if (arg == "-e" || arg == "--cell-type") {
+            if (++i >= argc) {
+                std::cerr << "Error: Missing value for " << arg << std::endl;
+                return false;
+            }
+            std::string cell_type = argv[i];
+            if (cell_type == "quad") args.cell_type = CellType::QUAD;
+            else if (cell_type == "simplex") args.cell_type = CellType::SIMPLEX;
+            else {
+                std::cerr << "Error: Invalid cell type: " << cell_type << std::endl;
+                std::cerr << "Valid cell types: quad|simplex" << std::endl;
+                return false;
+            }
+        }
         else {
             std::cerr << "Error: Unknown argument: " << arg << std::endl;
             return false;
@@ -1593,6 +1627,10 @@ bool parse_arguments(int argc, char* argv[], CommandLineArgs& args) {
         std::cout << "Note: diffusion generation is unsplit; ignoring -s/--split for output layout.\n";
         args.split = DatasetSplit::ALL;
     }
+    if (args.problem != ProblemType::DIFFUSION && args.cell_type != CellType::QUAD) {
+        std::cout << "Note: -e/--cell-type is only supported for Diffusion (-p D); ignoring for this problem type.\n";
+        args.cell_type = CellType::QUAD;
+    }
 
     return true;
 }
@@ -1612,6 +1650,9 @@ void print_configuration(const CommandLineArgs& args) {
     }
     std::cout << "\n";
     std::cout << "Scale: " << scale_to_string(args.scale) << "\n";
+    if (args.problem == ProblemType::DIFFUSION) {
+        std::cout << "Cell type: " << cell_type_to_string(args.cell_type) << "\n";
+    }
     std::cout << "Output directory: " << args.output_dir << "\n";
     std::cout << "Random seed: " << args.seed << "\n";
     if (args.num_threads > 0) {
